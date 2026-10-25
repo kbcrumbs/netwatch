@@ -13,6 +13,7 @@ mod rdns;
 mod services;
 mod sig;
 mod store;
+mod tray;
 
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -116,6 +117,14 @@ fn ack_alerts(store: State<Arc<Store>>, ids: Vec<i64>) -> Result<(), String> {
 
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
+        .on_window_event(|window, event| {
+            // Closing the window keeps NetWatch watching from the tray.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                tray::hide_to_tray(window);
+            }
+        })
         .manage(Latest::default())
         .manage(IntelRefresh(Mutex::new(None)))
         .manage(DeviceScan(Mutex::new(None)))
@@ -132,6 +141,13 @@ fn main() {
             app.manage(ports.clone());
             *app.state::<DeviceScan>().0.lock().unwrap() = Some(scan_tx);
             *app.state::<IntelRefresh>().0.lock().unwrap() = Some(refresh_tx);
+            tray::install(app)?;
+            // Started at login: stay in the tray until opened.
+            if std::env::args().any(|a| a == "--minimized") {
+                if let Some(w) = app.get_webview_window("main") {
+                    let _ = w.hide();
+                }
+            }
             std::thread::Builder::new()
                 .name("net-poller".into())
                 .spawn(move || {
@@ -144,8 +160,10 @@ fn main() {
                         ports,
                         localnames::LocalNames::start(),
                     );
+                    let mut notifier = tray::Notifier::default();
                     loop {
                         let snap = monitor.tick();
+                        notifier.check(&handle, &snap.alerts);
                         let _ = handle.emit("snapshot", &snap);
                         *latest.lock().unwrap() = Some(snap);
                         std::thread::sleep(POLL_INTERVAL);
