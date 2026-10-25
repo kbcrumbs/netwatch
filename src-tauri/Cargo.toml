@@ -3,6 +3,7 @@ name = "netwatch"
 version = "0.1.0"
 description = "Live security dashboard for incoming and outgoing network connections"
 edition = "2021"
+license = "MIT"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
