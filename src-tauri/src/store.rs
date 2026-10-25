@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS devices (
     mac TEXT PRIMARY KEY, ip TEXT NOT NULL, name TEXT, vendor TEXT,
     first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, ports TEXT, ports_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS watch (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS rules (
     kind TEXT NOT NULL, target TEXT NOT NULL, label TEXT, trusted INTEGER NOT NULL, created INTEGER NOT NULL,
     PRIMARY KEY (kind, target)
@@ -295,6 +296,30 @@ impl Store {
 
     pub fn mark_sweep_baselined(&self) -> Res<u64> {
         self.first_time("sweep_baseline_at")
+    }
+
+    /// Baseline of watched Windows settings (see watch.rs).
+    pub fn watch_baseline(&self) -> Res<HashMap<String, String>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare("SELECT key, value FROM watch")?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect()
+    }
+
+    pub fn save_watch(&self, upserts: &HashMap<String, String>, removed: &[String]) -> Res<()> {
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        {
+            let mut up = tx.prepare_cached("INSERT OR REPLACE INTO watch (key, value) VALUES (?1, ?2)")?;
+            for (k, v) in upserts {
+                up.execute([k, v])?;
+            }
+            let mut del = tx.prepare_cached("DELETE FROM watch WHERE key = ?1")?;
+            for k in removed {
+                del.execute([k])?;
+            }
+        }
+        tx.commit()
     }
 
     pub fn meta(&self, key: &str) -> Res<Option<String>> {

@@ -21,6 +21,7 @@ dns-lookup = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 ferrisetw = "1.2.0"
 tauri-plugin-notification = "2"
+winreg = "0.56.0"
 
 [dependencies.windows]
 version = "0.61"

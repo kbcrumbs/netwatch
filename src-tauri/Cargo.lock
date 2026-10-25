@@ -2220,6 +2220,7 @@ dependencies = [
  "tauri-plugin-notification",
  "ureq",
  "windows 0.61.3",
+ "winreg",
 ]
 
 [[package]]

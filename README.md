@@ -42,6 +42,14 @@ NetWatch only watches. It never blocks, kills or changes anything.
     RDP, VNC, network ADB and backdoor-style ports raise an alert.
   - **ARP spoofing check**: an alert if the router starts answering from a
     different hardware address.
+- **Settings change alerts**: checks every minute for new services,
+  disabled services being turned back on, new startup programs or Startup
+  folder files, new (non-Windows) scheduled tasks, and changes to NetBIOS,
+  mDNS, LLMNR and Chrome's casting policy. The first run records a baseline.
+- **Runs in the background**: closing the window keeps NetWatch in the
+  system tray, new medium and high alerts show a desktop notification, and
+  **Start at login** launches it in the tray at sign-in (via a Task Scheduler
+  task with highest privileges, so there's no UAC prompt).
 - **Geolocation and ownership**: country and network owner (ASN) for every
   public address.
 - **History**: 30 days of connections in a local SQLite database, searchable.

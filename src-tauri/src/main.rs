@@ -15,6 +15,7 @@ mod services;
 mod sig;
 mod store;
 mod tray;
+mod watch;
 
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -147,6 +148,7 @@ fn main() {
             let data_dir = app.path().app_local_data_dir()?;
             let store = Arc::new(Store::open(&data_dir.join("netwatch.db"))?);
             app.manage(store.clone());
+            watch::start(store.clone());
             let (intel, refresh_tx) = intel::Intel::start(data_dir.join("intel"));
             let vendors = devices::Vendors::start(data_dir.join("intel"));
             let (sweeper, scan_tx) = devices::Sweeper::start();
