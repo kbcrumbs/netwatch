@@ -42,6 +42,9 @@ NetWatch only watches. It never blocks, kills or changes anything.
     RDP, VNC, network ADB and backdoor-style ports raise an alert.
   - **ARP spoofing check**: an alert if the router starts answering from a
     different hardware address.
+- **Data usage per program**: bytes downloaded and uploaded since NetWatch
+  started, plus the current rate, from the Kernel-Network ETW provider
+  (traffic that stays on the PC isn't counted).
 - **Settings change alerts**: checks every minute for new services,
   disabled services being turned back on, new startup programs or Startup
   folder files, new (non-Windows) scheduled tasks, and changes to NetBIOS,

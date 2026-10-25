@@ -14,6 +14,7 @@ mod rdns;
 mod services;
 mod sig;
 mod store;
+mod traffic;
 mod tray;
 mod watch;
 
@@ -175,6 +176,7 @@ fn main() {
                         ports,
                         localnames::LocalNames::start(),
                     );
+                    monitor.set_traffic(traffic::Traffic::start());
                     let mut notifier = tray::Notifier::default();
                     loop {
                         let snap = monitor.tick();
@@ -206,6 +208,7 @@ fn main() {
         .run(|_, event| {
             if let tauri::RunEvent::Exit = event {
                 dns::DnsNames::stop();
+                traffic::Traffic::stop();
             }
         });
 }

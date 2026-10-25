@@ -386,7 +386,27 @@ function renderDestinations() {
 
 /* ---------- Programs ---------- */
 
+function fmtBytes(n) {
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
+}
+
+function trafficCell(total, rate) {
+  if (!total) return '<span class="dim">—</span>';
+  const live = rate >= 1024 ? ` <span class="rate">${fmtBytes(rate)}/s</span>` : "";
+  return `<span class="mono">${fmtBytes(total)}</span>${live}`;
+}
+
 const PROC_GET = {
+  down: (p) => p.recv,
+  up: (p) => p.sent,
   risk: (p) => RISK_RANK[p.risk] * 1000 + p.conns,
   process: (p) => p.process,
   sig: (p) => SIG_RANK[p.sig] ?? 9,
@@ -407,7 +427,7 @@ function groupPrograms() {
     let p = map.get(key);
     if (!p) {
       p = { key, process: c.process, path: c.path, sig: c.sig, signer: c.signer, programSince: c.programSince, programNew: c.programNew,
-        programTrusted: c.programTrusted, pids: new Set(), services: new Set(), conns: 0, hosts: new Set(), ports: new Set(), risk: "none", reasons: new Set(), enrich: [] };
+        programTrusted: c.programTrusted, pids: new Set(), services: new Set(), sent: 0, recv: 0, sentRate: 0, recvRate: 0, conns: 0, hosts: new Set(), ports: new Set(), risk: "none", reasons: new Set(), enrich: [] };
       map.set(key, p);
     }
     p.pids.add(c.pid);
@@ -420,6 +440,18 @@ function groupPrograms() {
     if (RISK_RANK[c.risk] > RISK_RANK[p.risk]) p.risk = c.risk;
     c.reasons.forEach((r) => p.reasons.add(r));
     p.enrich.push(...enrichFields(c));
+  }
+  // Byte counts are per process; add up every PID behind each program.
+  const byPid = new Map(state.snap.traffic.map((t) => [t.pid, t]));
+  for (const p of map.values()) {
+    for (const pid of p.pids) {
+      const t = byPid.get(pid);
+      if (!t) continue;
+      p.sent += t.sent;
+      p.recv += t.recv;
+      p.sentRate += t.sentRate;
+      p.recvRate += t.recvRate;
+    }
   }
   return [...map.values()];
 }
@@ -448,6 +480,8 @@ function renderPrograms() {
       return `<tr class="${p.risk !== "none" ? `risk-${p.risk}` : ""}">
         <td><span class="proc">${esc(p.process)}</span> <span class="dim mono" title="PIDs ${[...p.pids].join(", ")}">${[...p.pids].slice(0, 2).join(", ")}${p.pids.size > 2 ? ` +${p.pids.size - 2}` : ""}</span>${serviceTag([...p.services].sort())}${programTags(p)}${reasons}</td>
         <td>${sigBadge(p)} <span class="dim">${esc(p.signer ?? "")}</span> ${action}</td>
+        <td>${trafficCell(p.recv, p.recvRate)}</td>
+        <td>${trafficCell(p.sent, p.sentRate)}</td>
         <td class="mono">${p.conns}</td>
         <td class="mono clip" title="${esc(hosts.join("\n"))}">${hosts.length ? esc(hostText) : '<span class="dim">—</span>'}</td>
         <td class="mono">${p.ports.size ? [...p.ports].sort((a, b) => a - b).join(", ") : '<span class="dim">—</span>'}</td>
@@ -461,6 +495,8 @@ function renderPrograms() {
     <thead><tr>
       ${th("processes", "process", "Program / PIDs")}
       ${th("processes", "sig", "Signature")}
+      ${th("processes", "down", "Downloaded")}
+      ${th("processes", "up", "Uploaded")}
       ${th("processes", "conns", "Live conns")}
       ${th("processes", "hosts", "Remote hosts")}
       ${th("processes", "ports", "Open ports")}

@@ -20,6 +20,7 @@ use crate::rdns::Rdns;
 use crate::services;
 use crate::sig::{self, SigInfo};
 use crate::store::{Alert, Closed, Device, NewConn, Store, TickWrites};
+use crate::traffic::{Bytes, Traffic};
 
 const MAX_ALERTS: u32 = 500;
 /// Refresh last_seen of open history rows every this many polls.
@@ -103,6 +104,18 @@ pub struct Stats {
     pub risky: usize,
 }
 
+/// Bytes a process moved since NetWatch started, and its current rate.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ProcTraffic {
+    pub pid: u32,
+    pub sent: u64,
+    pub recv: u64,
+    /// Bytes per second over the last poll.
+    pub sent_rate: u64,
+    pub recv_rate: u64,
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceView {
@@ -139,6 +152,9 @@ pub struct Snapshot {
     pub conns: Vec<ConnView>,
     pub devices: Vec<DeviceView>,
     pub sweep: SweepStatus,
+    pub traffic: Vec<ProcTraffic>,
+    /// Per-process byte counting is running (needs admin).
+    pub traffic_active: bool,
     pub stats: Stats,
     pub alerts: Vec<Alert>,
     pub intel: IntelStatus,
@@ -262,6 +278,9 @@ pub struct Monitor {
     gateways: HashSet<IpAddr>,
     /// Gateway IP -> the MAC it last answered from (cached from the store).
     gateway_macs: HashMap<String, String>,
+    traffic: Arc<Traffic>,
+    /// Totals at the previous poll, for rates.
+    last_traffic: (u64, HashMap<u32, Bytes>),
     /// Our own PID; NetWatch's feed downloads are never flagged.
     me: u32,
 }
@@ -329,8 +348,30 @@ impl Monitor {
             local_names,
             gateways: HashSet::new(),
             gateway_macs: HashMap::new(),
+            traffic: Arc::default(),
+            last_traffic: (0, HashMap::new()),
             me: std::process::id(),
         }
+    }
+
+    /// Per-process byte counting; starts empty until set.
+    pub fn set_traffic(&mut self, traffic: Arc<Traffic>) {
+        self.traffic = traffic;
+    }
+
+    fn traffic_views(&mut self, names: &HashMap<u32, String>, now: u64) -> Vec<ProcTraffic> {
+        self.traffic.retain(|pid| names.contains_key(&pid));
+        let totals = self.traffic.totals();
+        let (then, prev) = std::mem::replace(&mut self.last_traffic, (now, totals.clone()));
+        let secs = now.saturating_sub(then) as f64 / 1000.0;
+        totals
+            .into_iter()
+            .map(|(pid, b)| {
+                let p = prev.get(&pid).copied().unwrap_or_default();
+                let rate = |cur: u64, old: u64| if secs > 0.0 { (cur.saturating_sub(old) as f64 / secs) as u64 } else { 0 };
+                ProcTraffic { pid, sent: b.sent, recv: b.recv, sent_rate: rate(b.sent, p.sent), recv_rate: rate(b.recv, p.recv) }
+            })
+            .collect()
     }
 
     fn sig_for(&self, path: &str) -> SigInfo {
@@ -528,6 +569,7 @@ impl Monitor {
         let mut seen = devices::neighbors(&ifaces.lan);
         seen.extend(answered);
         let devices = self.merge_devices(&seen, &sweep, now);
+        let traffic = self.traffic_views(&names, now);
         self.record_history(&conns);
         if first_tick {
             // The baseline is captured; later runs alert on anything new.
@@ -549,6 +591,8 @@ impl Monitor {
             conns,
             devices,
             sweep,
+            traffic,
+            traffic_active: self.traffic.active(),
             stats,
             alerts: self.store.recent_alerts(MAX_ALERTS).unwrap_or_default(),
             intel: self.intel.status(),
