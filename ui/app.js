@@ -1068,6 +1068,20 @@ invoke("system_info").then((info) => {
     : "Not elevated: some system programs can't be inspected. Release builds always ask for admin.";
 });
 
+invoke("get_autostart").then((on) => ($("autostart").checked = on));
+$("autostart").addEventListener("change", async (e) => {
+  const box = e.target;
+  box.disabled = true;
+  try {
+    box.checked = await invoke("set_autostart", { enabled: box.checked });
+    box.parentElement.title = "Start NetWatch in the tray when you sign in to Windows";
+  } catch (err) {
+    box.checked = !box.checked;
+    box.parentElement.title = `Couldn't change this: ${err}`;
+  }
+  box.disabled = false;
+});
+
 invoke("get_snapshot").then((s) => {
   if (s && !state.snap) {
     state.snap = s;

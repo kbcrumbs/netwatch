@@ -1,6 +1,7 @@
 // Hide the console window in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod autostart;
 mod devices;
 mod dns;
 mod ifaces;
@@ -77,6 +78,18 @@ fn scan_devices(scan: State<DeviceScan>) {
 fn scan_ports(ports: State<Arc<devices::PortScanner>>, mac: String, ip: String) -> Result<(), String> {
     let ip = ip.parse().map_err(|_| "invalid IP address".to_string())?;
     ports.request(mac, ip)
+}
+
+#[tauri::command]
+fn get_autostart() -> bool {
+    autostart::enabled()
+}
+
+/// Turns launch at login on or off; returns the resulting state.
+#[tauri::command]
+fn set_autostart(enabled: bool) -> Result<bool, String> {
+    autostart::set(enabled)?;
+    Ok(autostart::enabled())
 }
 
 /// Connections first seen within the last `hours`, newest first.
@@ -177,6 +190,8 @@ fn main() {
             refresh_intel,
             scan_devices,
             scan_ports,
+            get_autostart,
+            set_autostart,
             history,
             db_info,
             list_rules,
