@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS rules (
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct Rule {
-    /// "program" (target = exe path) or "ip" (target = address).
+    /// "program" (target = exe path), "ip" (target = address) or "device" (target = MAC).
     pub kind: String,
     pub target: String,
     pub label: Option<String>,
@@ -66,18 +66,20 @@ pub struct Rule {
 pub struct Rules {
     programs: HashMap<String, Rule>,
     ips: HashMap<String, Rule>,
+    devices: HashMap<String, Rule>,
 }
 
 impl Rules {
     fn key(kind: &str, target: &str) -> String {
-        // Windows paths are case-insensitive.
-        if kind == "program" { target.to_lowercase() } else { target.to_string() }
+        // Windows paths and MAC addresses are case-insensitive.
+        if kind == "ip" { target.to_string() } else { target.to_lowercase() }
     }
 
     fn insert(&mut self, r: Rule) {
         let key = Self::key(&r.kind, &r.target);
         match r.kind.as_str() {
             "program" => self.programs.insert(key, r),
+            "device" => self.devices.insert(key, r),
             _ => self.ips.insert(key, r),
         };
     }
@@ -86,6 +88,7 @@ impl Rules {
         let key = Self::key(kind, target);
         match kind {
             "program" => self.programs.remove(&key),
+            "device" => self.devices.remove(&key),
             _ => self.ips.remove(&key),
         };
     }
@@ -96,6 +99,10 @@ impl Rules {
 
     pub fn ip(&self, ip: &str) -> Option<&Rule> {
         self.ips.get(ip)
+    }
+
+    pub fn device(&self, mac: &str) -> Option<&Rule> {
+        self.devices.get(&mac.to_lowercase())
     }
 }
 

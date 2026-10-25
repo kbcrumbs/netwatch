@@ -97,7 +97,7 @@ fn list_rules(store: State<Arc<Store>>) -> Result<Vec<Rule>, String> {
 
 #[tauri::command]
 fn set_rule(store: State<Arc<Store>>, rule: Rule) -> Result<(), String> {
-    if !matches!(rule.kind.as_str(), "program" | "ip") || rule.target.trim().is_empty() {
+    if !matches!(rule.kind.as_str(), "program" | "ip" | "device") || rule.target.trim().is_empty() {
         return Err("invalid rule".into());
     }
     store.set_rule(rule).map_err(|e| e.to_string())

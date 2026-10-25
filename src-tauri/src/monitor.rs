@@ -116,6 +116,9 @@ pub struct DeviceView {
     pub new: bool,
     /// The default gateway of a local adapter.
     pub router: bool,
+    /// User's name for the device, and whether they trust it.
+    pub label: Option<String>,
+    pub trusted: bool,
     /// A port check is queued or running.
     pub checking_ports: bool,
 }
@@ -561,12 +564,20 @@ impl Monitor {
     }
 
     fn record_ports(&mut self, r: devices::PortResult) {
+        let rule = self.store.rules.read().unwrap().device(&r.mac).cloned();
         let Some(d) = self.devices.get_mut(&r.mac) else { return };
         d.ports = Some(r.open.clone());
         d.ports_at = Some(r.at);
         let d = d.clone();
         self.writes.devices.push(d.clone());
-        let who = d.name.clone().or(d.vendor.clone()).unwrap_or_else(|| "A device".into());
+        if rule.as_ref().is_some_and(|r| r.trusted) {
+            return;
+        }
+        let who = rule
+            .and_then(|r| r.label)
+            .or(d.name.clone())
+            .or(d.vendor.clone())
+            .unwrap_or_else(|| "A device".into());
         for port in r.open {
             if let Some(what) = devices::risky_port(port) {
                 self.raise_alert(
@@ -684,10 +695,13 @@ impl Monitor {
         }
         self.devices_learning = false;
 
+        let rules = self.store.rules.read().unwrap().clone();
         let mut views: Vec<DeviceView> = self
             .devices
             .values()
             .map(|d| DeviceView {
+                label: rules.device(&d.mac).and_then(|r| r.label.clone()),
+                trusted: rules.device(&d.mac).is_some_and(|r| r.trusted),
                 online: online.contains(&d.mac),
                 private_mac: u8::from_str_radix(&d.mac[..2], 16).is_ok_and(|b| b & 0x02 != 0),
                 new: d.first_seen > self.devices_baseline_at + 60_000 && now.saturating_sub(d.first_seen) < DAY_MS,
@@ -1081,6 +1095,41 @@ mod tests {
         m.check_gateway("192.0.2.1", "00:11:22:33:44:99", None);
         assert_eq!(spoof_alerts(&store), 1);
         assert_eq!(store.meta("gateway_mac|192.0.2.1").unwrap().as_deref(), Some("00:11:22:33:44:99"));
+    }
+
+    /// Risky open ports alert, except on devices the user trusts.
+    #[test]
+    fn trusted_devices_skip_port_alerts() {
+        let base = std::env::temp_dir().join("netwatch-test");
+        let db = base.join("trust-test.db");
+        let _ = std::fs::remove_file(&db);
+        let (intel, _refresh) = Intel::start(base.join("intel"));
+        let store = Arc::new(Store::open(&db).unwrap());
+        let mut m = Monitor::new(
+            intel,
+            store.clone(),
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+        );
+        m.update_devices(&[neighbor(1), neighbor(2)], 1_000, true);
+        let mac = |n: u8| devices::fmt_mac(&neighbor(n).mac);
+        store
+            .set_rule(Rule { kind: "device".into(), target: mac(1).to_uppercase(), label: Some("Desk PC".into()), trusted: true, created: 0 })
+            .unwrap();
+        let port_alerts = |s: &Store| s.recent_alerts(100).unwrap().iter().filter(|a| a.title.contains("port 3389")).count();
+
+        m.record_ports(devices::PortResult { mac: mac(1), open: vec![3389], at: 2_000 });
+        assert_eq!(port_alerts(&store), 0, "trusted device (rule matched case-insensitively)");
+        m.record_ports(devices::PortResult { mac: mac(2), open: vec![3389], at: 2_000 });
+        assert_eq!(port_alerts(&store), 1, "untrusted device alerts");
+
+        let views = m.update_devices(&[neighbor(1)], 3_000, true);
+        let desk = views.iter().find(|v| v.device.mac == mac(1)).unwrap();
+        assert_eq!(desk.label.as_deref(), Some("Desk PC"));
+        assert!(desk.trusted);
     }
 
     #[test]

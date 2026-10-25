@@ -562,7 +562,7 @@ function portsCell(d) {
 
 const DEV_GET = {
   status: (d) => (d.online ? 0 : 1),
-  name: (d) => (d.name ?? d.vendor ?? "").toLowerCase(),
+  name: (d) => (d.label ?? d.name ?? d.vendor ?? "").toLowerCase(),
   ip: (d) => ipKey(d.ip),
   mac: (d) => d.mac,
   vendor: (d) => (d.vendor ?? "").toLowerCase(),
@@ -573,7 +573,7 @@ const DEV_GET = {
 
 function renderDevices() {
   let rows = state.snap.devices.filter((d) =>
-    matchesSearch([d.name, d.ip, d.mac, d.vendor, d.privateMac && "private mac", d.router && "router", ...(d.ports ?? [])])
+    matchesSearch([d.label, d.name, d.ip, d.mac, d.vendor, d.privateMac && "private mac", d.router && "router", ...(d.ports ?? [])])
   );
   // Pre-sorting by address keeps ties in address order (the sort is stable).
   rows.sort((a, b) => cmp(ipKey(a.ip), ipKey(b.ip)));
@@ -597,19 +597,22 @@ function renderDevices() {
 
   const body = rows
     .map((d) => {
-      const name = d.name ?? d.vendor ?? (d.privateMac ? "Private device" : "Unknown device");
+      const name = d.label ?? d.name ?? d.vendor ?? (d.privateMac ? "Private device" : "Unknown device");
+      const sub = d.label && d.name ? `<span class="dim"> ${esc(d.name)}</span>` : "";
       const tags = (d.router ? `<span class="tag" title="Default gateway: your internet traffic goes through this device">Router</span>` : "")
         + (d.new ? `<span class="tag new" title="First seen ${esc(new Date(d.firstSeen).toLocaleString())}">New</span>` : "")
-        + (d.privateMac ? `<span class="tag" title="Randomized MAC address: phones and laptops use these for privacy, so there's no manufacturer">Private MAC</span>` : "");
+        + (d.privateMac ? `<span class="tag" title="Randomized MAC address: phones and laptops use these for privacy, so there's no manufacturer">Private MAC</span>` : "")
+        + (d.trusted ? trustedTag() : "");
       return `<tr class="${d.online ? "" : "offline"}">
         <td><span class="state-dot ${d.online ? "on" : ""}" title="${d.online ? "Online" : "Not seen right now"}"></span></td>
-        <td><span class="proc">${esc(name)}</span>${tags}</td>
+        <td><span class="proc ${d.label ? "label-name" : ""}">${esc(name)}</span>${sub}${tags}</td>
         <td class="mono">${esc(d.ip)}</td>
         <td class="mono">${esc(d.mac)}</td>
         <td>${d.vendor ? esc(d.vendor) : '<span class="dim">—</span>'}</td>
         <td>${portsCell(d)}</td>
         <td class="dim" title="${esc(new Date(d.firstSeen).toLocaleString())}">${when(d.firstSeen)}</td>
         <td class="dim" title="${esc(new Date(d.lastSeen).toLocaleString())}">${d.online ? "Now" : when(d.lastSeen)}</td>
+        <td class="actions"><button class="btn sm" type="button" data-action="label-device" data-mac="${esc(d.mac)}">${d.label || d.trusted ? "Edit" : "Label"}</button></td>
       </tr>`;
     })
     .join("");
@@ -624,6 +627,7 @@ function renderDevices() {
       ${th("devices", "ports", "Open ports")}
       ${th("devices", "first", "First seen")}
       ${th("devices", "last", "Last seen")}
+      <th></th>
     </tr></thead>
     <tbody>${body}</tbody>
   </table>`;
@@ -789,20 +793,21 @@ function renderRules() {
   $("shown").textContent = `${rules.length} rules`;
   if (!rules.length) {
     return emptyState(
-      "Use Trust on the Programs tab or Label on Destinations to add one. Trusted programs skip signature, location and port alerts; threat-feed matches always alert.",
+      "Use Trust on the Programs tab, or Label on Destinations or Devices. Trusted programs skip signature, location and port alerts; trusted devices skip open-port alerts; threat-feed matches always alert.",
       state.search ? "" : "Nothing trusted or labelled yet"
     );
   }
   const body = rules
     .map(
       (r) => `<tr>
-        <td>${r.kind === "program" ? "Program" : "Address"}</td>
+        <td>${{ program: "Program", device: "Device" }[r.kind] ?? "Address"}</td>
         <td class="mono">${esc(r.target)}</td>
         <td>${r.label ? `<span class="label-name">${esc(r.label)}</span>` : '<span class="dim">—</span>'}</td>
         <td>${r.trusted ? trustedTag() : '<span class="dim">Label only</span>'}</td>
         <td class="dim">${esc(new Date(r.created).toLocaleDateString())}</td>
         <td class="actions"><div class="row-actions">
           ${r.kind === "ip" ? `<button class="btn sm" type="button" data-action="label-ip" data-ip="${esc(r.target)}">Edit</button>` : ""}
+          ${r.kind === "device" ? `<button class="btn sm" type="button" data-action="label-device" data-mac="${esc(r.target)}">Edit</button>` : ""}
           <button class="btn sm danger" type="button" data-action="delete-rule" data-kind="${esc(r.kind)}" data-target="${esc(r.target)}">Remove</button>
         </div></td>
       </tr>`
@@ -816,26 +821,45 @@ function renderRules() {
 
 /* ---------- Label / trust dialog ---------- */
 
-const modal = { ip: null };
+const modal = { kind: null, target: null };
 
-function openLabelDialog(ip) {
-  const rule = state.rules.find((r) => r.kind === "ip" && r.target === ip);
-  const c = state.snap?.conns.find((x) => x.remoteAddr === ip);
-  modal.ip = ip;
-  $("modal-title").textContent = rule ? "Edit address" : "Label address";
-  $("modal-sub").textContent = [ip, c?.host, c?.org].filter(Boolean).join(" · ");
+function openRuleDialog(kind, target, { title, sub, trustText, hint }) {
+  const rule = state.rules.find((r) => r.kind === kind && r.target.toLowerCase() === target.toLowerCase());
+  Object.assign(modal, { kind, target });
+  $("modal-title").textContent = `${rule ? "Edit" : "Label"} ${title}`;
+  $("modal-sub").textContent = sub;
   $("modal-label").value = rule?.label ?? "";
   $("modal-trust").checked = rule?.trusted ?? false;
-  $("modal-trust-text").textContent = "Trust this address";
-  $("modal-hint").textContent = "Trusted addresses don't raise threat-feed or suspicious-port alerts.";
+  $("modal-trust-text").textContent = trustText;
+  $("modal-hint").textContent = hint;
   $("modal-remove").hidden = !rule;
   $("modal").hidden = false;
   $("modal-label").focus();
 }
 
+function openLabelDialog(ip) {
+  const c = state.snap?.conns.find((x) => x.remoteAddr === ip);
+  openRuleDialog("ip", ip, {
+    title: "address",
+    sub: [ip, c?.host, c?.org].filter(Boolean).join(" · "),
+    trustText: "Trust this address",
+    hint: "Trusted addresses don't raise threat-feed or suspicious-port alerts.",
+  });
+}
+
+function openDeviceDialog(mac) {
+  const d = state.snap?.devices.find((x) => x.mac === mac);
+  openRuleDialog("device", mac, {
+    title: "device",
+    sub: [d?.ip, d?.name, d?.vendor, mac].filter(Boolean).join(" · "),
+    trustText: "Trust this device",
+    hint: "Trusted devices don't raise open-port alerts. A change in the router's hardware address always alerts.",
+  });
+}
+
 function closeDialog() {
   $("modal").hidden = true;
-  modal.ip = null;
+  Object.assign(modal, { kind: null, target: null });
 }
 
 async function afterRuleChange() {
@@ -850,16 +874,16 @@ $("modal-form").addEventListener("submit", async (e) => {
   const label = $("modal-label").value.trim();
   const trusted = $("modal-trust").checked;
   if (!label && !trusted) {
-    await invoke("delete_rule", { kind: "ip", target: modal.ip });
+    await invoke("delete_rule", { kind: modal.kind, target: modal.target });
   } else {
-    await invoke("set_rule", { rule: { kind: "ip", target: modal.ip, label: label || null, trusted } });
+    await invoke("set_rule", { rule: { kind: modal.kind, target: modal.target, label: label || null, trusted } });
   }
   closeDialog();
   afterRuleChange();
 });
 $("modal-cancel").addEventListener("click", closeDialog);
 $("modal-remove").addEventListener("click", async () => {
-  await invoke("delete_rule", { kind: "ip", target: modal.ip });
+  await invoke("delete_rule", { kind: modal.kind, target: modal.target });
   closeDialog();
   afterRuleChange();
 });
@@ -950,6 +974,7 @@ document.querySelectorAll(".tab").forEach((btn) =>
 async function runAction(btn) {
   const { action } = btn.dataset;
   if (action === "label-ip") return openLabelDialog(btn.dataset.ip);
+  if (action === "label-device") return openDeviceDialog(btn.dataset.mac);
   if (action === "scan-ports") {
     invoke("scan_ports", { mac: btn.dataset.mac, ip: btn.dataset.ip }).catch(console.error);
     btn.disabled = true;
