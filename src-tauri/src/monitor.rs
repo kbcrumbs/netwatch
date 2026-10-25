@@ -12,6 +12,7 @@ use serde::Serialize;
 use crate::devices::{self, PortScanner, Sweeper, SweepStatus, Vendors};
 use crate::dns::DnsNames;
 use crate::ifaces;
+use crate::localnames::LocalNames;
 use crate::intel::{GeoInfo, Intel, IntelHit, IntelStatus};
 use crate::net::{self, Proto, TCP_ESTABLISHED, TCP_LISTEN};
 use crate::procs;
@@ -242,6 +243,8 @@ pub struct Monitor {
     /// on the network but never talked to this PC shouldn't each raise an alert.
     sweep_learning: bool,
     ports: Arc<PortScanner>,
+    /// Names devices announce for themselves (NetBIOS / mDNS).
+    local_names: Arc<LocalNames>,
     gateways: HashSet<IpAddr>,
     /// Gateway IP -> the MAC it last answered from (cached from the store).
     gateway_macs: HashMap<String, String>,
@@ -257,6 +260,7 @@ impl Monitor {
         vendors: Arc<Vendors>,
         sweeper: Arc<Sweeper>,
         ports: Arc<PortScanner>,
+        local_names: Arc<LocalNames>,
     ) -> Self {
         let sigs: Arc<Mutex<HashMap<String, SigInfo>>> = Arc::default();
         let (sig_tx, sig_rx) = mpsc::channel::<String>();
@@ -308,6 +312,7 @@ impl Monitor {
             sweeper,
             sweep_learning,
             ports,
+            local_names,
             gateways: HashSet::new(),
             gateway_macs: HashMap::new(),
             me: std::process::id(),
@@ -618,7 +623,12 @@ impl Monitor {
         for n in seen {
             let mac = devices::fmt_mac(&n.mac);
             let ip = fmt_ip(n.ip);
-            let name = self.rdns.lookup(n.ip);
+            // A device's own name beats whatever the router's DNS calls it.
+            let announced = match n.ip {
+                IpAddr::V4(v4) => self.local_names.name(&mac, v4),
+                IpAddr::V6(_) => None,
+            };
+            let name = announced.or_else(|| self.rdns.lookup(n.ip));
             let vendor = self.vendors.lookup(&n.mac);
             online.insert(mac.clone());
             if self.gateways.contains(&n.ip) {
@@ -1015,7 +1025,15 @@ mod tests {
         let (intel, _refresh) = Intel::start(base.join("intel"));
         let store = Arc::new(Store::open(&db).unwrap());
         let mut m =
-            Monitor::new(intel, store.clone(), Arc::default(), Arc::default(), Arc::default(), Arc::default());
+            Monitor::new(
+                intel,
+                store.clone(),
+                Arc::default(),
+                Arc::default(),
+                Arc::default(),
+                Arc::default(),
+                Arc::default(),
+            );
 
         let not_yet = SweepStatus::default();
         let swept = SweepStatus { last_scan: Some(2_500), ..Default::default() };
@@ -1046,7 +1064,15 @@ mod tests {
         let (intel, _refresh) = Intel::start(base.join("intel"));
         let store = Arc::new(Store::open(&db).unwrap());
         let mut m =
-            Monitor::new(intel, store.clone(), Arc::default(), Arc::default(), Arc::default(), Arc::default());
+            Monitor::new(
+                intel,
+                store.clone(),
+                Arc::default(),
+                Arc::default(),
+                Arc::default(),
+                Arc::default(),
+                Arc::default(),
+            );
         let spoof_alerts = |s: &Store| s.recent_alerts(100).unwrap().iter().filter(|a| a.severity == "high").count();
 
         m.check_gateway("192.0.2.1", "00:11:22:33:44:01", None);
@@ -1066,6 +1092,7 @@ mod tests {
         let mut m = Monitor::new(
             intel.clone(),
             store.clone(),
+            Arc::default(),
             Arc::default(),
             Arc::default(),
             Arc::default(),
@@ -1110,7 +1137,7 @@ mod tests {
         assert!(info.connections > 0, "history rows written");
 
         // A restarted monitor keeps the baseline and doesn't relearn.
-        let m2 = Monitor::new(intel, store, Arc::default(), Arc::default(), Arc::default(), Arc::default());
+        let m2 = Monitor::new(intel, store, Arc::default(), Arc::default(), Arc::default(), Arc::default(), Arc::default());
         assert!(!m2.learning);
     }
 }

@@ -4,6 +4,7 @@
 mod devices;
 mod dns;
 mod ifaces;
+mod localnames;
 mod intel;
 mod monitor;
 mod net;
@@ -134,7 +135,15 @@ fn main() {
             std::thread::Builder::new()
                 .name("net-poller".into())
                 .spawn(move || {
-                    let mut monitor = Monitor::new(intel, store, dns::DnsNames::start(), vendors, sweeper, ports);
+                    let mut monitor = Monitor::new(
+                        intel,
+                        store,
+                        dns::DnsNames::start(),
+                        vendors,
+                        sweeper,
+                        ports,
+                        localnames::LocalNames::start(),
+                    );
                     loop {
                         let snap = monitor.tick();
                         let _ = handle.emit("snapshot", &snap);

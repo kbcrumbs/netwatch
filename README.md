@@ -31,6 +31,11 @@ NetWatch only watches. It never blocks, kills or changes anything.
   on demand with **Scan now**; never through the VPN tunnel, capped at 1,024
   addresses), with its manufacturer from the IEEE MAC registry. Phones that use private,
   randomized MAC addresses are marked as such, and the router is labelled.
+  - **Device names** come from the device itself (NetBIOS for Windows PCs,
+    NAS boxes and printers; mDNS for phones, Macs and TVs), then the
+    router's DNS. Each query is a unicast packet to that one device, so
+    this PC never announces itself, and it works with NetBIOS and mDNS
+    turned off in Windows.
   - Devices that join after the first sweep raise an alert.
   - **Port check** on demand: about 30 common ports per device (SSH, HTTP,
     SMB, RDP, printers, casting, cameras), local addresses only. Telnet,
