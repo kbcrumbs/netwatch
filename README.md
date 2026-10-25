@@ -26,6 +26,11 @@ NetWatch only watches. It never blocks, kills or changes anything.
   - **VPN leaks**: public traffic leaving through another adapter while a VPN
     tunnel is up
   - programs and listening ports that are new since the first run
+- **Devices on your network**: every device this PC sees on the local network
+  (read passively from Windows' neighbor table, never through the VPN tunnel),
+  with its manufacturer from the IEEE MAC registry. Phones that use private,
+  randomized MAC addresses are marked as such. Devices that join after the
+  first run raise an alert.
 - **Geolocation and ownership**: country and network owner (ASN) for every
   public address.
 - **History**: 30 days of connections in a local SQLite database, searchable.
@@ -56,8 +61,8 @@ run `cargo tauri build`.
 
 Everything stays on your PC, in `%LOCALAPPDATA%\com.netwatch.dashboard\`:
 
-- `netwatch.db`: connection history, alerts and your rules
-- `intel\`: downloaded blocklists and geolocation databases
+- `netwatch.db`: connection history, devices, alerts and your rules
+- `intel\`: downloaded blocklists, geolocation and manufacturer databases
 
 The only network requests NetWatch makes itself are the downloads of the data
 sources below.
@@ -76,6 +81,7 @@ for following.
 | [CINS Army](https://cinsscore.com/) | Known attackers and scanners |
 | [Tor Project](https://check.torproject.org/torbulkexitlist) | Tor exit nodes |
 | [DB-IP Lite](https://db-ip.com/db/lite.php) | Country and ASN geolocation |
+| [IEEE MA-L registry](https://standards-oui.ieee.org/) | Device manufacturers from MAC addresses |
 
 IP geolocation by [DB-IP](https://db-ip.com), licensed under
 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).

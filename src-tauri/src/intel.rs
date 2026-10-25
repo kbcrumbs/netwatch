@@ -438,7 +438,7 @@ impl Intel {
 
 /* ---------- Helpers ---------- */
 
-fn download(url: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn download(url: &str) -> Result<Vec<u8>, String> {
     let resp = ureq::get(url)
         .set("User-Agent", "NetWatch/0.1 (personal connection monitor)")
         .timeout(Duration::from_secs(90))
@@ -478,7 +478,7 @@ fn download_geo(url_tpl: &str) -> Result<Vec<u8>, String> {
     Err(last_err)
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, bytes)?;
     fs::rename(&tmp, path)
@@ -489,7 +489,7 @@ fn modified_ms(path: &Path) -> Option<u64> {
     Some(t.duration_since(UNIX_EPOCH).ok()?.as_millis() as u64)
 }
 
-fn is_fresh(path: &Path, max_age: Duration) -> bool {
+pub(crate) fn is_fresh(path: &Path, max_age: Duration) -> bool {
     fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()

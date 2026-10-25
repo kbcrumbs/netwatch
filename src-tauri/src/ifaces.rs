@@ -1,7 +1,7 @@
 //! Network adapters and their addresses, used to tell which interface a
 //! connection leaves through and whether a VPN tunnel is up.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
@@ -24,6 +24,8 @@ pub struct Interfaces {
     by_addr: HashMap<IpAddr, Adapter>,
     /// Name of the first VPN adapter that is up, if any.
     pub vpn: Option<String>,
+    /// Interface indexes of non-VPN adapters with an address: the local network.
+    pub lan: HashSet<u32>,
 }
 
 impl Interfaces {
@@ -116,6 +118,10 @@ pub fn collect() -> Interfaces {
             }
             if adapter.vpn && has_addr && out.vpn.is_none() {
                 out.vpn = Some(adapter.name.clone());
+            }
+            if !adapter.vpn && has_addr {
+                out.lan.insert(a.Anonymous1.Anonymous.IfIndex);
+                out.lan.insert(a.Ipv6IfIndex);
             }
         }
     }

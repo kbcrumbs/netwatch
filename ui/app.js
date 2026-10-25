@@ -16,6 +16,7 @@ const state = {
     destinations: { key: "risk", dir: -1 },
     processes: { key: "risk", dir: -1 },
     listening: { key: "port", dir: 1 },
+    devices: { key: "status", dir: 1 },
   },
   history: null,
   histHours: 24,
@@ -168,6 +169,7 @@ function renderStats() {
     ["Flagged", st.risky, "Connections matching a risk rule", st.risky ? "bad" : ""],
     ["High alerts", high, "High-severity alerts you haven't dismissed", high ? "bad" : ""],
     ["Known programs", state.snap.knownPrograms, "Programs that have used the network since NetWatch was installed"],
+    ["Devices", state.snap.devices.filter((d) => d.online).length, `Devices on your local network right now (${state.snap.devices.length} known)`],
   ];
   $("stats").innerHTML = cards
     .map(([k, v, t, cls = ""]) => `<div class="stat ${cls}" title="${esc(t)}"><div class="v">${v}</div><div class="k">${k}</div></div>`)
@@ -525,6 +527,69 @@ function renderListening() {
   </table>`;
 }
 
+/* ---------- Devices ---------- */
+
+/** Sorts IPv4 numerically and puts IPv6 after it. */
+function ipKey(ip) {
+  const v4 = ip.split(".");
+  return v4.length === 4 ? v4.map((o) => o.padStart(3, "0")).join(".") : `~${ip}`;
+}
+
+const DEV_GET = {
+  status: (d) => (d.online ? 0 : 1),
+  name: (d) => (d.name ?? d.vendor ?? "").toLowerCase(),
+  ip: (d) => ipKey(d.ip),
+  mac: (d) => d.mac,
+  vendor: (d) => (d.vendor ?? "").toLowerCase(),
+  first: (d) => d.firstSeen,
+  last: (d) => d.lastSeen,
+};
+
+function renderDevices() {
+  let rows = state.snap.devices.filter((d) => matchesSearch([d.name, d.ip, d.mac, d.vendor, d.privateMac && "private mac"]));
+  // Pre-sorting by address keeps ties in address order (the sort is stable).
+  rows.sort((a, b) => cmp(ipKey(a.ip), ipKey(b.ip)));
+  rows = sortRows(rows, "devices", DEV_GET);
+  const online = state.snap.devices.filter((d) => d.online).length;
+  $("shown").textContent = `${online} online · ${state.snap.devices.length} known`;
+  if (!rows.length) {
+    return emptyState(
+      state.search ? "No devices match this filter." : "Devices appear here as this PC talks to them on the local network.",
+      state.search ? "" : "No devices yet"
+    );
+  }
+
+  const body = rows
+    .map((d) => {
+      const name = d.name ?? d.vendor ?? (d.privateMac ? "Private device" : "Unknown device");
+      const tags = (d.new ? `<span class="tag new" title="First seen ${esc(new Date(d.firstSeen).toLocaleString())}">New</span>` : "")
+        + (d.privateMac ? `<span class="tag" title="Randomized MAC address: phones and laptops use these for privacy, so there's no manufacturer">Private MAC</span>` : "");
+      return `<tr class="${d.online ? "" : "offline"}">
+        <td><span class="state-dot ${d.online ? "on" : ""}" title="${d.online ? "Online" : "Not seen right now"}"></span></td>
+        <td><span class="proc">${esc(name)}</span>${tags}</td>
+        <td class="mono">${esc(d.ip)}</td>
+        <td class="mono">${esc(d.mac)}</td>
+        <td>${d.vendor ? esc(d.vendor) : '<span class="dim">—</span>'}</td>
+        <td class="dim" title="${esc(new Date(d.firstSeen).toLocaleString())}">${when(d.firstSeen)}</td>
+        <td class="dim" title="${esc(new Date(d.lastSeen).toLocaleString())}">${d.online ? "Now" : when(d.lastSeen)}</td>
+      </tr>`;
+    })
+    .join("");
+
+  $("view").innerHTML = `<table>
+    <thead><tr>
+      ${th("devices", "status", "")}
+      ${th("devices", "name", "Device")}
+      ${th("devices", "ip", "IP address")}
+      ${th("devices", "mac", "MAC address")}
+      ${th("devices", "vendor", "Manufacturer")}
+      ${th("devices", "first", "First seen")}
+      ${th("devices", "last", "Last seen")}
+    </tr></thead>
+    <tbody>${body}</tbody>
+  </table>`;
+}
+
 /* ---------- Alerts ---------- */
 
 function when(ms) {
@@ -802,6 +867,7 @@ const VIEWS = {
   destinations: renderDestinations,
   processes: renderPrograms,
   listening: renderListening,
+  devices: renderDevices,
   history: renderHistory,
   alerts: renderAlerts,
   rules: renderRules,

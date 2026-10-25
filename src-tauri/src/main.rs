@@ -1,6 +1,7 @@
 // Hide the console window in release builds.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod devices;
 mod dns;
 mod ifaces;
 mod intel;
@@ -106,11 +107,12 @@ fn main() {
             let store = Arc::new(Store::open(&data_dir.join("netwatch.db"))?);
             app.manage(store.clone());
             let (intel, refresh_tx) = intel::Intel::start(data_dir.join("intel"));
+            let vendors = devices::Vendors::start(data_dir.join("intel"));
             *app.state::<IntelRefresh>().0.lock().unwrap() = Some(refresh_tx);
             std::thread::Builder::new()
                 .name("net-poller".into())
                 .spawn(move || {
-                    let mut monitor = Monitor::new(intel, store, dns::DnsNames::start());
+                    let mut monitor = Monitor::new(intel, store, dns::DnsNames::start(), vendors);
                     loop {
                         let snap = monitor.tick();
                         let _ = handle.emit("snapshot", &snap);

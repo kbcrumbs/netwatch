@@ -38,6 +38,10 @@ CREATE TABLE IF NOT EXISTS alerts (
     pid INTEGER NOT NULL, acked INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS alerts_ts ON alerts (ts);
+CREATE TABLE IF NOT EXISTS devices (
+    mac TEXT PRIMARY KEY, ip TEXT NOT NULL, name TEXT, vendor TEXT,
+    first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS rules (
     kind TEXT NOT NULL, target TEXT NOT NULL, label TEXT, trusted INTEGER NOT NULL, created INTEGER NOT NULL,
     PRIMARY KEY (kind, target)
@@ -139,6 +143,18 @@ pub struct Closed {
     pub risk: &'static str,
 }
 
+/// A device on the local network, keyed by its MAC address.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Device {
+    pub mac: String,
+    pub ip: String,
+    pub name: Option<String>,
+    pub vendor: Option<String>,
+    pub first_seen: u64,
+    pub last_seen: u64,
+}
+
 /// Everything one poll needs to persist, written in a single transaction.
 #[derive(Default)]
 pub struct TickWrites {
@@ -150,6 +166,8 @@ pub struct TickWrites {
     pub new_programs: Vec<(String, String)>,
     pub seen_programs: Vec<String>,
     pub new_listeners: Vec<(String, u16)>,
+    /// New devices, and seen ones whose address, name or last_seen changed.
+    pub devices: Vec<Device>,
 }
 
 #[derive(Serialize)]
@@ -233,18 +251,41 @@ impl Store {
         let c = self.conn.lock().unwrap();
         c.execute("DELETE FROM connections WHERE last_seen < ?1", [now.saturating_sub(HISTORY_DAYS * DAY_MS)])?;
         c.execute("DELETE FROM alerts WHERE ts < ?1", [now.saturating_sub(ALERT_DAYS * DAY_MS)])?;
+        c.execute("DELETE FROM devices WHERE last_seen < ?1", [now.saturating_sub(ALERT_DAYS * DAY_MS)])?;
         Ok(())
     }
 
     /// When the first-ever baseline was captured; set on first call.
     pub fn baseline_at(&self) -> Res<u64> {
+        self.first_time("baseline_at")
+    }
+
+    /// When devices were first recorded (they arrived after the program baseline).
+    pub fn devices_baseline_at(&self) -> Res<u64> {
+        self.first_time("devices_baseline_at")
+    }
+
+    fn first_time(&self, key: &str) -> Res<u64> {
         let c = self.conn.lock().unwrap();
-        c.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('baseline_at', ?1)",
-            [now_ms().to_string()],
-        )?;
-        let v: String = c.query_row("SELECT value FROM meta WHERE key = 'baseline_at'", [], |r| r.get(0))?;
+        c.execute("INSERT OR IGNORE INTO meta (key, value) VALUES (?1, ?2)", [key, &now_ms().to_string()])?;
+        let v: String = c.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))?;
         Ok(v.parse().unwrap_or(0))
+    }
+
+    pub fn devices(&self) -> Res<Vec<Device>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare("SELECT mac, ip, name, vendor, first_seen, last_seen FROM devices")?;
+        let rows = st.query_map([], |r| {
+            Ok(Device {
+                mac: r.get(0)?,
+                ip: r.get(1)?,
+                name: r.get(2)?,
+                vendor: r.get(3)?,
+                first_seen: r.get(4)?,
+                last_seen: r.get(5)?,
+            })
+        })?;
+        rows.collect()
     }
 
     pub fn known_programs(&self) -> Res<HashMap<String, u64>> {
@@ -319,6 +360,14 @@ impl Store {
             )?;
             for (exe, port) in &w.new_listeners {
                 lis.execute(params![exe, port, now])?;
+            }
+            let mut dev = tx.prepare_cached(
+                "INSERT INTO devices (mac, ip, name, vendor, first_seen, last_seen) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (mac) DO UPDATE SET ip = excluded.ip, name = COALESCE(excluded.name, name),
+                 vendor = COALESCE(excluded.vendor, vendor), last_seen = excluded.last_seen",
+            )?;
+            for d in &w.devices {
+                dev.execute(params![d.mac, d.ip, d.name, d.vendor, d.first_seen, d.last_seen])?;
             }
         }
         tx.commit()?;

@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::devices::{self, Vendors};
 use crate::dns::DnsNames;
 use crate::ifaces;
 use crate::intel::{GeoInfo, Intel, IntelHit, IntelStatus};
@@ -17,7 +18,7 @@ use crate::procs;
 use crate::rdns::Rdns;
 use crate::services;
 use crate::sig::{self, SigInfo};
-use crate::store::{Alert, Closed, NewConn, Store, TickWrites};
+use crate::store::{Alert, Closed, Device, NewConn, Store, TickWrites};
 
 const MAX_ALERTS: u32 = 500;
 /// Refresh last_seen of open history rows every this many polls.
@@ -103,6 +104,19 @@ pub struct Stats {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct DeviceView {
+    #[serde(flatten)]
+    pub device: Device,
+    /// In the neighbor table right now.
+    pub online: bool,
+    /// Randomized MAC: no manufacturer, may change between networks.
+    pub private_mac: bool,
+    /// First seen after the device baseline, within the last day.
+    pub new: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub ts: u64,
     pub started: u64,
@@ -115,6 +129,7 @@ pub struct Snapshot {
     /// Hostnames come from Windows' DNS lookups (not just reverse DNS).
     pub dns_names: bool,
     pub conns: Vec<ConnView>,
+    pub devices: Vec<DeviceView>,
     pub stats: Stats,
     pub alerts: Vec<Alert>,
     pub intel: IntelStatus,
@@ -211,12 +226,18 @@ pub struct Monitor {
     services: HashMap<u32, Vec<String>>,
     /// VPN adapter that is up during the current poll.
     vpn: Option<String>,
+    vendors: Arc<Vendors>,
+    /// mac -> device, every device seen within the retention window.
+    devices: HashMap<String, Device>,
+    devices_baseline_at: u64,
+    /// No devices recorded yet: the first poll records them without alerts.
+    devices_learning: bool,
     /// Our own PID; NetWatch's feed downloads are never flagged.
     me: u32,
 }
 
 impl Monitor {
-    pub fn new(intel: Arc<Intel>, store: Arc<Store>, dns: Arc<DnsNames>) -> Self {
+    pub fn new(intel: Arc<Intel>, store: Arc<Store>, dns: Arc<DnsNames>, vendors: Arc<Vendors>) -> Self {
         let sigs: Arc<Mutex<HashMap<String, SigInfo>>> = Arc::default();
         let (sig_tx, sig_rx) = mpsc::channel::<String>();
 
@@ -235,6 +256,9 @@ impl Monitor {
         let known_programs = store.known_programs().unwrap_or_default();
         let known_listeners = store.known_listeners().unwrap_or_default();
         let alerted = store.alert_keys().unwrap_or_default();
+        let devices_baseline_at = store.devices_baseline_at().unwrap_or(0);
+        let devices: HashMap<String, Device> =
+            store.devices().unwrap_or_default().into_iter().map(|d| (d.mac.clone(), d)).collect();
 
         Self {
             started: now_ms(),
@@ -256,6 +280,10 @@ impl Monitor {
             dns,
             services: HashMap::new(),
             vpn: None,
+            vendors,
+            devices_learning: devices.is_empty(),
+            devices_baseline_at,
+            devices,
             me: std::process::id(),
         }
     }
@@ -271,6 +299,20 @@ impl Monitor {
     }
 
     fn alert(&mut self, key: String, severity: &'static str, title: String, detail: String, c: &ConnView) {
+        self.raise_alert(key, severity, title, detail, c.who(), c.exe(), c.pid);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn raise_alert(
+        &mut self,
+        key: String,
+        severity: &'static str,
+        title: String,
+        detail: String,
+        process: String,
+        exe: String,
+        pid: u32,
+    ) {
         if !self.alerted.insert(key.clone()) {
             return;
         }
@@ -280,9 +322,9 @@ impl Monitor {
             severity: severity.to_string(),
             title,
             detail,
-            process: c.who(),
-            exe: c.exe(),
-            pid: c.pid,
+            process,
+            exe,
+            pid,
             acked: false,
         };
         if let Err(e) = self.store.add_alert(&key, &alert) {
@@ -436,6 +478,7 @@ impl Monitor {
                 .is_some_and(|t| t > self.baseline_at + 60_000 && now.saturating_sub(t) < DAY_MS);
         }
 
+        let devices = self.update_devices(&devices::neighbors(&ifaces.lan), now);
         self.record_history(&conns);
         if first_tick {
             // The baseline is captured; later runs alert on anything new.
@@ -455,10 +498,76 @@ impl Monitor {
             vpn: self.vpn.clone(),
             dns_names: self.dns.active(),
             conns,
+            devices,
             stats,
             alerts: self.store.recent_alerts(MAX_ALERTS).unwrap_or_default(),
             intel: self.intel.status(),
         }
+    }
+
+    /// Merges this poll's neighbor table into the device list, queues database
+    /// writes and alerts on devices never seen before.
+    fn update_devices(&mut self, seen: &[devices::Neighbor], now: u64) -> Vec<DeviceView> {
+        let mut online = HashSet::new();
+        for n in seen {
+            let mac = devices::fmt_mac(&n.mac);
+            let ip = fmt_ip(n.ip);
+            let name = self.rdns.lookup(n.ip);
+            let vendor = self.vendors.lookup(&n.mac);
+            online.insert(mac.clone());
+            match self.devices.get_mut(&mac) {
+                Some(d) => {
+                    let changed = d.ip != ip
+                        || (name.is_some() && d.name != name)
+                        || (vendor.is_some() && d.vendor.is_none());
+                    d.ip = ip;
+                    d.name = name.or(d.name.take());
+                    d.vendor = vendor.or(d.vendor.take());
+                    d.last_seen = now;
+                    if changed || self.tick % TOUCH_EVERY == 0 {
+                        self.writes.devices.push(d.clone());
+                    }
+                }
+                None => {
+                    let d = Device { mac: mac.clone(), ip, name, vendor, first_seen: now, last_seen: now };
+                    if !self.devices_learning {
+                        let what = d.name.clone().or(d.vendor.clone()).unwrap_or_else(|| {
+                            let kind = if devices::is_private_mac(&n.mac) { "Device with a private MAC" } else { "Unknown device" };
+                            kind.to_string()
+                        });
+                        // Devices that were already around trickle in as Windows talks to
+                        // them, so the first day after the baseline is informational.
+                        let severity = if now < self.devices_baseline_at + DAY_MS { "info" } else { "medium" };
+                        let vendor = d.vendor.as_deref().map(|v| format!(" · {v}")).unwrap_or_default();
+                        self.raise_alert(
+                            format!("device|{mac}"),
+                            severity,
+                            format!("New device on your network: {what}"),
+                            format!("{} · {mac}{vendor}", d.ip),
+                            "Local network".into(),
+                            String::new(),
+                            0,
+                        );
+                    }
+                    self.writes.devices.push(d.clone());
+                    self.devices.insert(mac, d);
+                }
+            }
+        }
+        self.devices_learning = false;
+
+        let mut views: Vec<DeviceView> = self
+            .devices
+            .values()
+            .map(|d| DeviceView {
+                online: online.contains(&d.mac),
+                private_mac: u8::from_str_radix(&d.mac[..2], 16).is_ok_and(|b| b & 0x02 != 0),
+                new: d.first_seen > self.devices_baseline_at + 60_000 && now.saturating_sub(d.first_seen) < DAY_MS,
+                device: d.clone(),
+            })
+            .collect();
+        views.sort_by(|a, b| b.online.cmp(&a.online).then_with(|| a.device.ip.cmp(&b.device.ip)));
+        views
     }
 
     /// Writes opened/closed connections plus baseline changes for this poll.
@@ -774,7 +883,7 @@ mod tests {
         let _ = std::fs::remove_file(base.join("test.db"));
         let (intel, _refresh) = Intel::start(base.join("intel"));
         let store = Arc::new(Store::open(&base.join("test.db")).unwrap());
-        let mut m = Monitor::new(intel.clone(), store.clone(), Arc::default());
+        let mut m = Monitor::new(intel.clone(), store.clone(), Arc::default(), Arc::default());
         assert!(m.learning, "fresh database starts in learning mode");
         m.tick();
         assert!(!m.learning);
@@ -814,7 +923,7 @@ mod tests {
         assert!(info.connections > 0, "history rows written");
 
         // A restarted monitor keeps the baseline and doesn't relearn.
-        let m2 = Monitor::new(intel, store, Arc::default());
+        let m2 = Monitor::new(intel, store, Arc::default(), Arc::default());
         assert!(!m2.learning);
     }
 }
