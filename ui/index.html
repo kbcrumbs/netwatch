@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>NetWatch</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+        <path d="M16 2.5 28 6.7l-.7 11L16 29.5 4.7 17.7 4 6.7Z" fill="var(--accent)" />
+        <circle cx="16" cy="15.5" r="5" fill="none" stroke="var(--bg)" stroke-width="1.8" />
+        <circle cx="16" cy="15.5" r="1.6" fill="var(--bg)" />
+      </svg>
+      <div>
+        <h1>NetWatch</h1>
+        <div class="sub" id="host">Connection monitor</div>
+      </div>
+    </div>
+    <div class="top-right">
+      <span class="badge" id="vpn-badge">VPN…</span>
+      <span class="badge" id="intel-badge">Threat intel…</span>
+      <span class="badge" id="admin-badge">…</span>
+      <span class="live" id="live"><span class="dot"></span><span id="live-text">Starting</span></span>
+      <button class="btn" id="pause" type="button">Pause</button>
+    </div>
+  </header>
+
+  <section class="stats" id="stats"></section>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-tab="connections" role="tab">Connections</button>
+    <button class="tab" data-tab="destinations" role="tab">Destinations</button>
+    <button class="tab" data-tab="processes" role="tab">Programs</button>
+    <button class="tab" data-tab="listening" role="tab">Open ports</button>
+    <button class="tab" data-tab="history" role="tab">History</button>
+    <button class="tab" data-tab="alerts" role="tab">Alerts <span class="count" id="alert-count" hidden></span></button>
+    <button class="tab" data-tab="rules" role="tab">Trusted &amp; labels</button>
+  </nav>
+
+  <section class="toolbar" id="toolbar">
+    <input id="search" type="search" placeholder="Filter by program, IP, host, country, network, port…" autocomplete="off" spellcheck="false" />
+    <label class="chip"><input type="checkbox" id="f-loopback" checked /> Hide loopback</label>
+    <label class="chip"><input type="checkbox" id="f-established" /> Established only</label>
+    <label class="chip"><input type="checkbox" id="f-risky" /> Flagged only</label>
+    <label class="chip"><input type="checkbox" id="f-udp" /> Show UDP</label>
+    <select id="hist-range" class="select" hidden aria-label="History range">
+      <option value="1">Last hour</option>
+      <option value="24" selected>Last 24 hours</option>
+      <option value="168">Last 7 days</option>
+      <option value="720">Last 30 days</option>
+    </select>
+    <label class="chip" id="show-acked-chip" hidden><input type="checkbox" id="f-acked" /> Show dismissed</label>
+    <button class="btn" id="copy-alerts" type="button" hidden>Copy all</button>
+    <button class="btn" id="ack-all" type="button" hidden>Dismiss all</button>
+    <span class="shown" id="shown"></span>
+  </section>
+
+  <main id="view"></main>
+
+  <footer class="foot">
+    <span id="updated">Waiting for first scan…</span>
+    <span>Monitor only: NetWatch never blocks or changes anything · IP geolocation by DB-IP (db-ip.com), CC BY 4.0</span>
+  </footer>
+
+  <div class="modal" id="modal" hidden>
+    <form class="modal-box" id="modal-form" autocomplete="off">
+      <h2 id="modal-title">Label address</h2>
+      <div class="modal-sub mono" id="modal-sub"></div>
+      <label class="field">Name
+        <input id="modal-label" maxlength="60" placeholder="e.g. Family Room TV" />
+      </label>
+      <label class="check"><input type="checkbox" id="modal-trust" /> <span id="modal-trust-text">Trust this address</span></label>
+      <div class="modal-hint" id="modal-hint"></div>
+      <div class="modal-actions">
+        <button type="button" class="btn danger" id="modal-remove">Remove</button>
+        <span class="spacer"></span>
+        <button type="button" class="btn" id="modal-cancel">Cancel</button>
+        <button type="submit" class="btn primary">Save</button>
+      </div>
+    </form>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
