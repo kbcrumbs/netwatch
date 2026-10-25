@@ -177,6 +177,17 @@ fn risky_listener(port: u16) -> Option<&'static str> {
     })
 }
 
+/// Alert severity for a program in a suspicious folder. Installers and updaters
+/// (e.g. Visual Studio's) run signed copies of themselves from Temp, so signed
+/// ones are informational; None while the signature check is still running.
+fn location_severity(sig: &str) -> Option<&'static str> {
+    match sig {
+        "pending" => None,
+        "signed" => Some("info"),
+        _ => Some("high"),
+    }
+}
+
 fn suspicious_location(path: &str) -> Option<&'static str> {
     let p = path.to_ascii_lowercase();
     if p.contains("\\appdata\\local\\temp\\") || p.contains("\\windows\\temp\\") {
@@ -870,8 +881,12 @@ impl Monitor {
                 }
                 _ => {}
             }
+            // Installers and updaters (e.g. Visual Studio's) legitimately run signed
+            // copies of themselves from Temp; only unsigned ones there are suspicious.
             if let Some(why) = c.path.as_deref().and_then(suspicious_location) {
-                raise("high");
+                if c.sig != "signed" {
+                    raise("high");
+                }
                 reasons.push(format!("Program {why}"));
             }
         }
@@ -916,11 +931,16 @@ impl Monitor {
                     &c,
                 );
             }
-            if let Some(why) = c.path.as_deref().and_then(suspicious_location).filter(|_| heuristics) {
+            let located = c.path.as_deref().and_then(suspicious_location).filter(|_| heuristics);
+            if let (Some(why), Some(severity)) = (located, location_severity(c.sig)) {
+                let signed_by = match (c.sig, c.signer.as_deref()) {
+                    ("signed", signer) => format!(" (signed by {})", signer.unwrap_or("a trusted publisher")),
+                    _ => String::new(),
+                };
                 self.alert(
                     format!("loc|{exe}"),
-                    "high",
-                    format!("Network activity from a program that {why}"),
+                    severity,
+                    format!("Network activity from a program that {why}{signed_by}"),
                     format!("{} → {target}\n{exe}", c.process),
                     &c,
                 );
@@ -1095,6 +1115,15 @@ mod tests {
         m.check_gateway("192.0.2.1", "00:11:22:33:44:99", None);
         assert_eq!(spoof_alerts(&store), 1);
         assert_eq!(store.meta("gateway_mac|192.0.2.1").unwrap().as_deref(), Some("00:11:22:33:44:99"));
+    }
+
+    #[test]
+    fn temp_folder_severity_follows_signature() {
+        assert!(suspicious_location(r"C:\Users\someone\AppData\Local\Temp\x1\setup.exe").is_some());
+        assert_eq!(location_severity("signed"), Some("info"));
+        assert_eq!(location_severity("unsigned"), Some("high"));
+        assert_eq!(location_severity("invalid"), Some("high"));
+        assert_eq!(location_severity("pending"), None, "wait for the signature check");
     }
 
     /// Risky open ports alert, except on devices the user trusts.
