@@ -535,6 +535,31 @@ function ipKey(ip) {
   return v4.length === 4 ? v4.map((o) => o.padStart(3, "0")).join(".") : `~${ip}`;
 }
 
+const PORT_NAMES = {
+  21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 53: "DNS", 80: "HTTP", 110: "POP3", 135: "Windows RPC",
+  139: "NetBIOS", 143: "IMAP", 443: "HTTPS", 445: "SMB file sharing", 515: "LPD printing", 548: "AFP file sharing",
+  554: "RTSP video stream", 631: "IPP printing", 1337: "Backdoor-style port", 1883: "MQTT", 3389: "Remote Desktop",
+  4444: "Backdoor-style port", 5000: "UPnP / NAS admin", 5357: "Windows device discovery", 5555: "Android debugging (ADB)",
+  5900: "VNC remote control", 8000: "HTTP (alt)", 8008: "Chromecast / HTTP (alt)", 8009: "Chromecast",
+  8080: "HTTP (alt)", 8443: "HTTPS (alt)", 9100: "Raw printing", 31337: "Backdoor-style port", 32400: "Plex",
+  62078: "iPhone sync",
+};
+const RISKY_PORTS = new Set([23, 3389, 5555, 5900, 1337, 4444, 31337]);
+
+function portsCell(d) {
+  if (d.checkingPorts) return '<span class="dim">Checking…</span>';
+  const btn = d.online
+    ? ` <button class="btn sm" type="button" data-action="scan-ports" data-mac="${esc(d.mac)}" data-ip="${esc(d.ip)}">${d.ports ? "Recheck" : "Check"}</button>`
+    : "";
+  if (!d.ports) return `<span class="dim">Not checked</span>${btn}`;
+  const list = d.ports.length
+    ? d.ports
+        .map((p) => `<span class="mono ${RISKY_PORTS.has(p) ? "port-risky" : ""}" title="${esc(PORT_NAMES[p] ?? "")}">${p}</span>`)
+        .join(" ")
+    : '<span class="dim">None open</span>';
+  return `<span title="Checked ${esc(new Date(d.portsAt).toLocaleString())}">${list}</span>${btn}`;
+}
+
 const DEV_GET = {
   status: (d) => (d.online ? 0 : 1),
   name: (d) => (d.name ?? d.vendor ?? "").toLowerCase(),
@@ -543,10 +568,13 @@ const DEV_GET = {
   vendor: (d) => (d.vendor ?? "").toLowerCase(),
   first: (d) => d.firstSeen,
   last: (d) => d.lastSeen,
+  ports: (d) => (d.ports ? d.ports.length : -1),
 };
 
 function renderDevices() {
-  let rows = state.snap.devices.filter((d) => matchesSearch([d.name, d.ip, d.mac, d.vendor, d.privateMac && "private mac"]));
+  let rows = state.snap.devices.filter((d) =>
+    matchesSearch([d.name, d.ip, d.mac, d.vendor, d.privateMac && "private mac", d.router && "router", ...(d.ports ?? [])])
+  );
   // Pre-sorting by address keeps ties in address order (the sort is stable).
   rows.sort((a, b) => cmp(ipKey(a.ip), ipKey(b.ip)));
   rows = sortRows(rows, "devices", DEV_GET);
@@ -570,7 +598,8 @@ function renderDevices() {
   const body = rows
     .map((d) => {
       const name = d.name ?? d.vendor ?? (d.privateMac ? "Private device" : "Unknown device");
-      const tags = (d.new ? `<span class="tag new" title="First seen ${esc(new Date(d.firstSeen).toLocaleString())}">New</span>` : "")
+      const tags = (d.router ? `<span class="tag" title="Default gateway: your internet traffic goes through this device">Router</span>` : "")
+        + (d.new ? `<span class="tag new" title="First seen ${esc(new Date(d.firstSeen).toLocaleString())}">New</span>` : "")
         + (d.privateMac ? `<span class="tag" title="Randomized MAC address: phones and laptops use these for privacy, so there's no manufacturer">Private MAC</span>` : "");
       return `<tr class="${d.online ? "" : "offline"}">
         <td><span class="state-dot ${d.online ? "on" : ""}" title="${d.online ? "Online" : "Not seen right now"}"></span></td>
@@ -578,6 +607,7 @@ function renderDevices() {
         <td class="mono">${esc(d.ip)}</td>
         <td class="mono">${esc(d.mac)}</td>
         <td>${d.vendor ? esc(d.vendor) : '<span class="dim">—</span>'}</td>
+        <td>${portsCell(d)}</td>
         <td class="dim" title="${esc(new Date(d.firstSeen).toLocaleString())}">${when(d.firstSeen)}</td>
         <td class="dim" title="${esc(new Date(d.lastSeen).toLocaleString())}">${d.online ? "Now" : when(d.lastSeen)}</td>
       </tr>`;
@@ -591,6 +621,7 @@ function renderDevices() {
       ${th("devices", "ip", "IP address")}
       ${th("devices", "mac", "MAC address")}
       ${th("devices", "vendor", "Manufacturer")}
+      ${th("devices", "ports", "Open ports")}
       ${th("devices", "first", "First seen")}
       ${th("devices", "last", "Last seen")}
     </tr></thead>
@@ -919,6 +950,12 @@ document.querySelectorAll(".tab").forEach((btn) =>
 async function runAction(btn) {
   const { action } = btn.dataset;
   if (action === "label-ip") return openLabelDialog(btn.dataset.ip);
+  if (action === "scan-ports") {
+    invoke("scan_ports", { mac: btn.dataset.mac, ip: btn.dataset.ip }).catch(console.error);
+    btn.disabled = true;
+    btn.textContent = "Checking…";
+    return;
+  }
   if (action === "copy-alert") {
     const a = state.snap.alerts.find((x) => x.id === Number(btn.dataset.id));
     return a && copyText(a.id, alertText(a)).catch(console.error);

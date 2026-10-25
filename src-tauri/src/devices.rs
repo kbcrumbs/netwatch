@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
@@ -216,6 +216,139 @@ impl Sweeper {
     }
 }
 
+/* ---------- Port check ---------- */
+
+const PORT_TIMEOUT: Duration = Duration::from_millis(400);
+
+/// Ports worth knowing about on home devices.
+pub const COMMON_PORTS: &[(u16, &str)] = &[
+    (21, "FTP"),
+    (22, "SSH"),
+    (23, "Telnet"),
+    (25, "SMTP"),
+    (53, "DNS"),
+    (80, "HTTP"),
+    (110, "POP3"),
+    (135, "Windows RPC"),
+    (139, "NetBIOS"),
+    (143, "IMAP"),
+    (443, "HTTPS"),
+    (445, "SMB file sharing"),
+    (515, "LPD printing"),
+    (548, "AFP file sharing"),
+    (554, "RTSP video stream"),
+    (631, "IPP printing"),
+    (1337, "Backdoor-style port"),
+    (1883, "MQTT"),
+    (3389, "Remote Desktop"),
+    (4444, "Backdoor-style port"),
+    (5000, "UPnP / NAS admin"),
+    (5357, "Windows device discovery"),
+    (5555, "Android debugging (ADB)"),
+    (5900, "VNC remote control"),
+    (8000, "HTTP (alt)"),
+    (8008, "Chromecast / HTTP (alt)"),
+    (8009, "Chromecast"),
+    (8080, "HTTP (alt)"),
+    (8443, "HTTPS (alt)"),
+    (9100, "Raw printing"),
+    (31337, "Backdoor-style port"),
+    (32400, "Plex"),
+    (62078, "iPhone sync"),
+];
+
+/// Open ports that hand out control of a device; worth an alert.
+pub fn risky_port(port: u16) -> Option<&'static str> {
+    Some(match port {
+        23 => "Telnet (unencrypted remote shell)",
+        3389 => "Remote Desktop",
+        5555 => "Android debugging over the network",
+        5900..=5903 => "VNC remote control",
+        1337 | 4444 | 31337 => "a backdoor-style port",
+        _ => return None,
+    })
+}
+
+/// TCP-connects to each common port in parallel; returns the open ones, sorted.
+fn check_ports(ip: IpAddr) -> Vec<u16> {
+    let open = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for &(port, _) in COMMON_PORTS {
+            let open = &open;
+            s.spawn(move || {
+                if TcpStream::connect_timeout(&SocketAddr::new(ip, port), PORT_TIMEOUT).is_ok() {
+                    open.lock().unwrap().push(port);
+                }
+            });
+        }
+    });
+    let mut v = open.into_inner().unwrap();
+    v.sort_unstable();
+    v
+}
+
+/// A finished port check for one device.
+pub struct PortResult {
+    pub mac: String,
+    pub open: Vec<u16>,
+    pub at: u64,
+}
+
+#[derive(Default)]
+struct PortState {
+    /// MACs with a check queued or running.
+    busy: HashSet<String>,
+    done: Vec<PortResult>,
+}
+
+/// Runs port checks requested from the UI, one device at a time.
+#[derive(Default)]
+pub struct PortScanner {
+    state: Mutex<PortState>,
+    tx: Mutex<Option<Sender<(String, IpAddr)>>>,
+}
+
+impl PortScanner {
+    pub fn start() -> Arc<Self> {
+        let me = Arc::new(Self::default());
+        let (tx, rx) = mpsc::channel::<(String, IpAddr)>();
+        *me.tx.lock().unwrap() = Some(tx);
+        let worker = me.clone();
+        std::thread::Builder::new()
+            .name("port-check".into())
+            .spawn(move || {
+                for (mac, ip) in rx {
+                    let open = check_ports(ip);
+                    let mut st = worker.state.lock().unwrap();
+                    st.busy.remove(&mac);
+                    st.done.push(PortResult { mac, open, at: now_ms() });
+                }
+            })
+            .expect("spawn port checker");
+        me
+    }
+
+    /// Queues a check. Only addresses on the local network are allowed.
+    pub fn request(&self, mac: String, ip: IpAddr) -> Result<(), String> {
+        if crate::net::scope(ip) != "private" {
+            return Err("only devices on the local network can be checked".into());
+        }
+        if !self.state.lock().unwrap().busy.insert(mac.clone()) {
+            return Ok(());
+        }
+        match self.tx.lock().unwrap().as_ref() {
+            Some(tx) => tx.send((mac, ip)).map_err(|e| e.to_string()),
+            None => Err("port checker not running".into()),
+        }
+    }
+
+    /// MACs being checked, plus checks finished since the last call.
+    pub fn take(&self) -> (HashSet<String>, Vec<PortResult>) {
+        let mut st = self.state.lock().unwrap();
+        (st.busy.clone(), std::mem::take(&mut st.done))
+    }
+}
+
 /* ---------- Manufacturer lookup ---------- */
 
 #[derive(Default)]
@@ -340,6 +473,26 @@ mod tests {
         let found = sweep(&nets);
         println!("sweep: {} subnets, {} devices answered in {:.1?}", nets.len(), found.len(), started.elapsed());
         assert!(found.iter().all(|n| is_device_mac(&n.mac)));
+    }
+
+    #[test]
+    fn risky_ports_are_in_the_check_list() {
+        for port in [23, 3389, 5555, 5900, 1337, 4444, 31337] {
+            assert!(risky_port(port).is_some());
+            assert!(COMMON_PORTS.iter().any(|&(p, _)| p == port), "port {port} is checked");
+        }
+        assert!(risky_port(443).is_none());
+    }
+
+    /// Checks this PC's own loopback, which never leaves the machine.
+    #[test]
+    fn checks_ports_on_loopback() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:8008");
+        let open = check_ports(IpAddr::from([127, 0, 0, 1]));
+        if listener.is_ok() {
+            assert!(open.contains(&8008), "our own listener shows up as open");
+        }
+        assert!(PortScanner::default().request("x".into(), IpAddr::from([8, 8, 8, 8])).is_err(), "public IPs refused");
     }
 
     /// Reads this PC's neighbor table; prints only a count, never addresses.

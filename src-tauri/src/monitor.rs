@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::devices::{self, Sweeper, SweepStatus, Vendors};
+use crate::devices::{self, PortScanner, Sweeper, SweepStatus, Vendors};
 use crate::dns::DnsNames;
 use crate::ifaces;
 use crate::intel::{GeoInfo, Intel, IntelHit, IntelStatus};
@@ -113,6 +113,10 @@ pub struct DeviceView {
     pub private_mac: bool,
     /// First seen after the device baseline, within the last day.
     pub new: bool,
+    /// The default gateway of a local adapter.
+    pub router: bool,
+    /// A port check is queued or running.
+    pub checking_ports: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -237,6 +241,10 @@ pub struct Monitor {
     /// The first sweep's answers become baseline too: devices that were already
     /// on the network but never talked to this PC shouldn't each raise an alert.
     sweep_learning: bool,
+    ports: Arc<PortScanner>,
+    gateways: HashSet<IpAddr>,
+    /// Gateway IP -> the MAC it last answered from (cached from the store).
+    gateway_macs: HashMap<String, String>,
     /// Our own PID; NetWatch's feed downloads are never flagged.
     me: u32,
 }
@@ -248,6 +256,7 @@ impl Monitor {
         dns: Arc<DnsNames>,
         vendors: Arc<Vendors>,
         sweeper: Arc<Sweeper>,
+        ports: Arc<PortScanner>,
     ) -> Self {
         let sigs: Arc<Mutex<HashMap<String, SigInfo>>> = Arc::default();
         let (sig_tx, sig_rx) = mpsc::channel::<String>();
@@ -298,6 +307,9 @@ impl Monitor {
             devices,
             sweeper,
             sweep_learning,
+            ports,
+            gateways: HashSet::new(),
+            gateway_macs: HashMap::new(),
             me: std::process::id(),
         }
     }
@@ -356,6 +368,7 @@ impl Monitor {
         let rules = self.store.rules.read().unwrap().clone();
         let ifaces = ifaces::collect();
         self.vpn = ifaces.vpn.clone();
+        self.gateways = ifaces.gateways.clone();
 
         // Drop cached paths for PIDs that exited or were reused by another exe.
         self.paths.retain(|pid, (name, _)| names.get(pid) == Some(name));
@@ -527,12 +540,75 @@ impl Monitor {
     /// devices already on the network shouldn't each raise an alert just
     /// because Windows happened to talk to them before the sweep finished.
     fn merge_devices(&mut self, seen: &[devices::Neighbor], sweep: &SweepStatus, now: u64) -> Vec<DeviceView> {
-        let views = self.update_devices(seen, now, self.sweep_learning);
+        let (checking, finished) = self.ports.take();
+        for r in finished {
+            self.record_ports(r);
+        }
+        let mut views = self.update_devices(seen, now, self.sweep_learning);
+        for v in &mut views {
+            v.checking_ports = checking.contains(&v.device.mac);
+        }
         if self.sweep_learning && sweep.last_scan.is_some() {
             self.sweep_learning = false;
             let _ = self.store.mark_sweep_baselined();
         }
         views
+    }
+
+    fn record_ports(&mut self, r: devices::PortResult) {
+        let Some(d) = self.devices.get_mut(&r.mac) else { return };
+        d.ports = Some(r.open.clone());
+        d.ports_at = Some(r.at);
+        let d = d.clone();
+        self.writes.devices.push(d.clone());
+        let who = d.name.clone().or(d.vendor.clone()).unwrap_or_else(|| "A device".into());
+        for port in r.open {
+            if let Some(what) = devices::risky_port(port) {
+                self.raise_alert(
+                    format!("dport|{}|{port}", d.mac),
+                    "medium",
+                    format!("{who} has {what} open (port {port})"),
+                    format!("{} · {}\nAnyone on your network can try to log in to it.", d.ip, d.mac),
+                    "Local network".into(),
+                    String::new(),
+                    0,
+                );
+            }
+        }
+    }
+
+    /// A router that suddenly answers from a different MAC is the classic sign
+    /// of ARP spoofing: another device claiming its address to intercept traffic.
+    fn check_gateway(&mut self, ip: &str, mac: &str, vendor: Option<&str>) {
+        let key = format!("gateway_mac|{ip}");
+        if !self.gateway_macs.contains_key(ip) {
+            if let Ok(Some(known)) = self.store.meta(&key) {
+                self.gateway_macs.insert(ip.to_string(), known);
+            }
+        }
+        match self.gateway_macs.get(ip) {
+            Some(known) if known == mac => {}
+            Some(known) => {
+                let known = known.clone();
+                self.raise_alert(
+                    format!("gwmac|{ip}|{mac}"),
+                    "high",
+                    format!("Your router's hardware address changed ({ip})"),
+                    format!(
+                        "Was {known}, now {mac}{}.\nExpected if you replaced your router; otherwise another device may be impersonating it (ARP spoofing).",
+                        vendor.map(|v| format!(" ({v})")).unwrap_or_default()
+                    ),
+                    "Local network".into(),
+                    String::new(),
+                    0,
+                );
+            }
+            None => {}
+        }
+        if self.gateway_macs.get(ip).map(String::as_str) != Some(mac) {
+            self.gateway_macs.insert(ip.to_string(), mac.to_string());
+            let _ = self.store.set_meta(&key, mac);
+        }
     }
 
     /// Merges this poll's neighbor table into the device list, queues database
@@ -545,6 +621,9 @@ impl Monitor {
             let name = self.rdns.lookup(n.ip);
             let vendor = self.vendors.lookup(&n.mac);
             online.insert(mac.clone());
+            if self.gateways.contains(&n.ip) {
+                self.check_gateway(&ip, &mac, vendor.as_deref());
+            }
             match self.devices.get_mut(&mac) {
                 Some(d) => {
                     let changed = d.ip != ip
@@ -559,7 +638,16 @@ impl Monitor {
                     }
                 }
                 None => {
-                    let d = Device { mac: mac.clone(), ip, name, vendor, first_seen: now, last_seen: now };
+                    let d = Device {
+                        mac: mac.clone(),
+                        ip,
+                        name,
+                        vendor,
+                        first_seen: now,
+                        last_seen: now,
+                        ports: None,
+                        ports_at: None,
+                    };
                     if !self.devices_learning && !quiet {
                         let what = d.name.clone().or(d.vendor.clone()).unwrap_or_else(|| {
                             let kind = if devices::is_private_mac(&n.mac) { "Device with a private MAC" } else { "Unknown device" };
@@ -593,6 +681,8 @@ impl Monitor {
                 online: online.contains(&d.mac),
                 private_mac: u8::from_str_radix(&d.mac[..2], 16).is_ok_and(|b| b & 0x02 != 0),
                 new: d.first_seen > self.devices_baseline_at + 60_000 && now.saturating_sub(d.first_seen) < DAY_MS,
+                router: d.ip.parse().is_ok_and(|ip| self.gateways.contains(&ip)),
+                checking_ports: false,
                 device: d.clone(),
             })
             .collect();
@@ -924,7 +1014,8 @@ mod tests {
         let _ = std::fs::remove_file(&db);
         let (intel, _refresh) = Intel::start(base.join("intel"));
         let store = Arc::new(Store::open(&db).unwrap());
-        let mut m = Monitor::new(intel, store.clone(), Arc::default(), Arc::default(), Arc::default());
+        let mut m =
+            Monitor::new(intel, store.clone(), Arc::default(), Arc::default(), Arc::default(), Arc::default());
 
         let not_yet = SweepStatus::default();
         let swept = SweepStatus { last_scan: Some(2_500), ..Default::default() };
@@ -945,13 +1036,41 @@ mod tests {
         assert_eq!(views.iter().filter(|v| v.online).count(), 2);
     }
 
+    /// The router answering from a new MAC raises a high alert; the first
+    /// sighting and repeat sightings don't.
+    #[test]
+    fn router_mac_change_alerts() {
+        let base = std::env::temp_dir().join("netwatch-test");
+        let db = base.join("gateway-test.db");
+        let _ = std::fs::remove_file(&db);
+        let (intel, _refresh) = Intel::start(base.join("intel"));
+        let store = Arc::new(Store::open(&db).unwrap());
+        let mut m =
+            Monitor::new(intel, store.clone(), Arc::default(), Arc::default(), Arc::default(), Arc::default());
+        let spoof_alerts = |s: &Store| s.recent_alerts(100).unwrap().iter().filter(|a| a.severity == "high").count();
+
+        m.check_gateway("192.0.2.1", "00:11:22:33:44:01", None);
+        m.check_gateway("192.0.2.1", "00:11:22:33:44:01", None);
+        assert_eq!(spoof_alerts(&store), 0, "first sighting is the baseline");
+        m.check_gateway("192.0.2.1", "00:11:22:33:44:99", None);
+        assert_eq!(spoof_alerts(&store), 1);
+        assert_eq!(store.meta("gateway_mac|192.0.2.1").unwrap().as_deref(), Some("00:11:22:33:44:99"));
+    }
+
     #[test]
     fn live_scan_smoke() {
         let base = std::env::temp_dir().join("netwatch-test");
         let _ = std::fs::remove_file(base.join("test.db"));
         let (intel, _refresh) = Intel::start(base.join("intel"));
         let store = Arc::new(Store::open(&base.join("test.db")).unwrap());
-        let mut m = Monitor::new(intel.clone(), store.clone(), Arc::default(), Arc::default(), Arc::default());
+        let mut m = Monitor::new(
+            intel.clone(),
+            store.clone(),
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+            Arc::default(),
+        );
         assert!(m.learning, "fresh database starts in learning mode");
         m.tick();
         assert!(!m.learning);
@@ -991,7 +1110,7 @@ mod tests {
         assert!(info.connections > 0, "history rows written");
 
         // A restarted monitor keeps the baseline and doesn't relearn.
-        let m2 = Monitor::new(intel, store, Arc::default(), Arc::default(), Arc::default());
+        let m2 = Monitor::new(intel, store, Arc::default(), Arc::default(), Arc::default(), Arc::default());
         assert!(!m2.learning);
     }
 }

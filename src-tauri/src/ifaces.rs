@@ -6,11 +6,12 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use windows::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
+    GetAdaptersAddresses, GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+    GAA_FLAG_SKIP_MULTICAST,
     IF_TYPE_PROP_VIRTUAL, IF_TYPE_SOFTWARE_LOOPBACK, IF_TYPE_TUNNEL, IP_ADAPTER_ADDRESSES_LH,
 };
 use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
-use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6};
+use windows::Win32::Networking::WinSock::{AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6};
 
 #[derive(Clone, Debug)]
 pub struct Adapter {
@@ -35,6 +36,8 @@ pub struct Interfaces {
     pub lan: HashSet<u32>,
     /// IPv4 subnets of those adapters (link-local addresses excluded).
     pub lan_v4: Vec<LanNet>,
+    /// Default gateways (routers) of those adapters.
+    pub gateways: HashSet<IpAddr>,
 }
 
 impl Interfaces {
@@ -59,9 +62,27 @@ fn looks_like_vpn(if_type: u32, name: &str, desc: &str) -> bool {
         || ["vpn", "wireguard", "wintun", "tap-windows", "openvpn"].iter().any(|k| text.contains(k))
 }
 
+unsafe fn sockaddr_ip(sa: *const SOCKADDR) -> Option<IpAddr> {
+    if sa.is_null() {
+        return None;
+    }
+    match (*sa).sa_family {
+        AF_INET => {
+            let sin = &*(sa as *const SOCKADDR_IN);
+            Some(IpAddr::V4(Ipv4Addr::from(sin.sin_addr.S_un.S_addr.to_ne_bytes())))
+        }
+        AF_INET6 => {
+            let sin6 = &*(sa as *const SOCKADDR_IN6);
+            Some(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.u.Byte)))
+        }
+        _ => None,
+    }
+}
+
 pub fn collect() -> Interfaces {
     let mut out = Interfaces::default();
-    let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    let flags =
+        GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_INCLUDE_GATEWAYS;
     // u64 buffer keeps the adapter structs aligned.
     let mut size: u32 = 16 * 1024;
     let mut buf: Vec<u64> = Vec::new();
@@ -107,21 +128,7 @@ pub fn collect() -> Interfaces {
             while !ua.is_null() {
                 let u = &*ua;
                 ua = u.Next;
-                let sa = u.Address.lpSockaddr;
-                if sa.is_null() {
-                    continue;
-                }
-                let ip = match (*sa).sa_family {
-                    AF_INET => {
-                        let sin = &*(sa as *const SOCKADDR_IN);
-                        IpAddr::V4(Ipv4Addr::from(sin.sin_addr.S_un.S_addr.to_ne_bytes()))
-                    }
-                    AF_INET6 => {
-                        let sin6 = &*(sa as *const SOCKADDR_IN6);
-                        IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.u.Byte))
-                    }
-                    _ => continue,
-                };
+                let Some(ip) = sockaddr_ip(u.Address.lpSockaddr) else { continue };
                 has_addr = true;
                 out.by_addr.insert(ip, adapter.clone());
                 if let IpAddr::V4(v4) = ip {
@@ -136,6 +143,14 @@ pub fn collect() -> Interfaces {
             if !adapter.vpn && has_addr {
                 out.lan.insert(a.Anonymous1.Anonymous.IfIndex);
                 out.lan.insert(a.Ipv6IfIndex);
+                let mut gw = a.FirstGatewayAddress;
+                while !gw.is_null() {
+                    let g = &*gw;
+                    gw = g.Next;
+                    if let Some(ip) = sockaddr_ip(g.Address.lpSockaddr).filter(|ip| !ip.is_unspecified()) {
+                        out.gateways.insert(ip);
+                    }
+                }
             }
         }
     }

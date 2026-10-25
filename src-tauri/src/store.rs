@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS alerts (
 CREATE INDEX IF NOT EXISTS alerts_ts ON alerts (ts);
 CREATE TABLE IF NOT EXISTS devices (
     mac TEXT PRIMARY KEY, ip TEXT NOT NULL, name TEXT, vendor TEXT,
-    first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL
+    first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, ports TEXT, ports_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS rules (
     kind TEXT NOT NULL, target TEXT NOT NULL, label TEXT, trusted INTEGER NOT NULL, created INTEGER NOT NULL,
@@ -153,6 +153,17 @@ pub struct Device {
     pub vendor: Option<String>,
     pub first_seen: u64,
     pub last_seen: u64,
+    /// Open ports from the last port check; None if never checked.
+    pub ports: Option<Vec<u16>>,
+    pub ports_at: Option<u64>,
+}
+
+fn ports_to_text(ports: &Option<Vec<u16>>) -> Option<String> {
+    ports.as_ref().map(|v| v.iter().map(u16::to_string).collect::<Vec<_>>().join(","))
+}
+
+fn ports_from_text(text: Option<String>) -> Option<Vec<u16>> {
+    text.map(|t| t.split(',').filter_map(|p| p.parse().ok()).collect())
 }
 
 /// Everything one poll needs to persist, written in a single transaction.
@@ -234,6 +245,9 @@ impl Store {
         }
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        // Columns added after the devices table first shipped; fails harmlessly once present.
+        let _ = conn.execute("ALTER TABLE devices ADD COLUMN ports TEXT", []);
+        let _ = conn.execute("ALTER TABLE devices ADD COLUMN ports_at INTEGER", []);
         // Rows left open by a previous run ended when that run did.
         conn.execute("UPDATE connections SET open = 0 WHERE open = 1", [])?;
         let store = Store { conn: Mutex::new(conn), rules: RwLock::default(), path: path.to_path_buf() };
@@ -276,6 +290,19 @@ impl Store {
         self.first_time("sweep_baseline_at")
     }
 
+    pub fn meta(&self, key: &str) -> Res<Option<String>> {
+        let c = self.conn.lock().unwrap();
+        let mut st = c.prepare_cached("SELECT value FROM meta WHERE key = ?1")?;
+        let mut rows = st.query([key])?;
+        rows.next()?.map(|r| r.get(0)).transpose()
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Res<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)", [key, value])?;
+        Ok(())
+    }
+
     fn first_time(&self, key: &str) -> Res<u64> {
         let c = self.conn.lock().unwrap();
         c.execute("INSERT OR IGNORE INTO meta (key, value) VALUES (?1, ?2)", [key, &now_ms().to_string()])?;
@@ -285,7 +312,7 @@ impl Store {
 
     pub fn devices(&self) -> Res<Vec<Device>> {
         let c = self.conn.lock().unwrap();
-        let mut st = c.prepare("SELECT mac, ip, name, vendor, first_seen, last_seen FROM devices")?;
+        let mut st = c.prepare("SELECT mac, ip, name, vendor, first_seen, last_seen, ports, ports_at FROM devices")?;
         let rows = st.query_map([], |r| {
             Ok(Device {
                 mac: r.get(0)?,
@@ -294,6 +321,8 @@ impl Store {
                 vendor: r.get(3)?,
                 first_seen: r.get(4)?,
                 last_seen: r.get(5)?,
+                ports: ports_from_text(r.get(6)?),
+                ports_at: r.get(7)?,
             })
         })?;
         rows.collect()
@@ -373,12 +402,16 @@ impl Store {
                 lis.execute(params![exe, port, now])?;
             }
             let mut dev = tx.prepare_cached(
-                "INSERT INTO devices (mac, ip, name, vendor, first_seen, last_seen) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO devices (mac, ip, name, vendor, first_seen, last_seen, ports, ports_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT (mac) DO UPDATE SET ip = excluded.ip, name = COALESCE(excluded.name, name),
-                 vendor = COALESCE(excluded.vendor, vendor), last_seen = excluded.last_seen",
+                 vendor = COALESCE(excluded.vendor, vendor), last_seen = excluded.last_seen,
+                 ports = COALESCE(excluded.ports, ports), ports_at = COALESCE(excluded.ports_at, ports_at)",
             )?;
             for d in &w.devices {
-                dev.execute(params![d.mac, d.ip, d.name, d.vendor, d.first_seen, d.last_seen])?;
+                dev.execute(params![
+                    d.mac, d.ip, d.name, d.vendor, d.first_seen, d.last_seen, ports_to_text(&d.ports), d.ports_at
+                ])?;
             }
         }
         tx.commit()?;

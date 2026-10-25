@@ -70,6 +70,13 @@ fn scan_devices(scan: State<DeviceScan>) {
     }
 }
 
+/// Checks a local device's common ports in the background.
+#[tauri::command]
+fn scan_ports(ports: State<Arc<devices::PortScanner>>, mac: String, ip: String) -> Result<(), String> {
+    let ip = ip.parse().map_err(|_| "invalid IP address".to_string())?;
+    ports.request(mac, ip)
+}
+
 /// Connections first seen within the last `hours`, newest first.
 #[tauri::command]
 fn history(store: State<Arc<Store>>, hours: u64, search: String) -> Result<HistoryResult, String> {
@@ -120,12 +127,14 @@ fn main() {
             let (intel, refresh_tx) = intel::Intel::start(data_dir.join("intel"));
             let vendors = devices::Vendors::start(data_dir.join("intel"));
             let (sweeper, scan_tx) = devices::Sweeper::start();
+            let ports = devices::PortScanner::start();
+            app.manage(ports.clone());
             *app.state::<DeviceScan>().0.lock().unwrap() = Some(scan_tx);
             *app.state::<IntelRefresh>().0.lock().unwrap() = Some(refresh_tx);
             std::thread::Builder::new()
                 .name("net-poller".into())
                 .spawn(move || {
-                    let mut monitor = Monitor::new(intel, store, dns::DnsNames::start(), vendors, sweeper);
+                    let mut monitor = Monitor::new(intel, store, dns::DnsNames::start(), vendors, sweeper, ports);
                     loop {
                         let snap = monitor.tick();
                         let _ = handle.emit("snapshot", &snap);
@@ -140,6 +149,7 @@ fn main() {
             system_info,
             refresh_intel,
             scan_devices,
+            scan_ports,
             history,
             db_info,
             list_rules,

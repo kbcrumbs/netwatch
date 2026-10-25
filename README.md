@@ -30,8 +30,13 @@ NetWatch only watches. It never blocks, kills or changes anything.
   Windows' neighbor table plus an ARP sweep of the subnet every 5 minutes (or
   on demand with **Scan now**; never through the VPN tunnel, capped at 1,024
   addresses), with its manufacturer from the IEEE MAC registry. Phones that use private,
-  randomized MAC addresses are marked as such. Devices that join after the
-  first run raise an alert.
+  randomized MAC addresses are marked as such, and the router is labelled.
+  - Devices that join after the first sweep raise an alert.
+  - **Port check** on demand: about 30 common ports per device (SSH, HTTP,
+    SMB, RDP, printers, casting, cameras), local addresses only. Telnet,
+    RDP, VNC, network ADB and backdoor-style ports raise an alert.
+  - **ARP spoofing check**: an alert if the router starts answering from a
+    different hardware address.
 - **Geolocation and ownership**: country and network owner (ASN) for every
   public address.
 - **History**: 30 days of connections in a local SQLite database, searchable.
