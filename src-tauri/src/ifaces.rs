@@ -18,6 +18,13 @@ pub struct Adapter {
     pub vpn: bool,
 }
 
+/// An IPv4 subnet this PC is on, outside any VPN tunnel.
+#[derive(Clone, Debug)]
+pub struct LanNet {
+    pub ip: Ipv4Addr,
+    pub prefix: u8,
+}
+
 #[derive(Default)]
 pub struct Interfaces {
     /// Local address -> the adapter that owns it.
@@ -26,6 +33,8 @@ pub struct Interfaces {
     pub vpn: Option<String>,
     /// Interface indexes of non-VPN adapters with an address: the local network.
     pub lan: HashSet<u32>,
+    /// IPv4 subnets of those adapters (link-local addresses excluded).
+    pub lan_v4: Vec<LanNet>,
 }
 
 impl Interfaces {
@@ -115,6 +124,11 @@ pub fn collect() -> Interfaces {
                 };
                 has_addr = true;
                 out.by_addr.insert(ip, adapter.clone());
+                if let IpAddr::V4(v4) = ip {
+                    if !adapter.vpn && !v4.is_link_local() {
+                        out.lan_v4.push(LanNet { ip: v4, prefix: u.OnLinkPrefixLength });
+                    }
+                }
             }
             if adapter.vpn && has_addr && out.vpn.is_none() {
                 out.vpn = Some(adapter.name.clone());

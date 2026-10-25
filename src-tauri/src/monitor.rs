@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::devices::{self, Vendors};
+use crate::devices::{self, Sweeper, SweepStatus, Vendors};
 use crate::dns::DnsNames;
 use crate::ifaces;
 use crate::intel::{GeoInfo, Intel, IntelHit, IntelStatus};
@@ -130,6 +130,7 @@ pub struct Snapshot {
     pub dns_names: bool,
     pub conns: Vec<ConnView>,
     pub devices: Vec<DeviceView>,
+    pub sweep: SweepStatus,
     pub stats: Stats,
     pub alerts: Vec<Alert>,
     pub intel: IntelStatus,
@@ -232,12 +233,22 @@ pub struct Monitor {
     devices_baseline_at: u64,
     /// No devices recorded yet: the first poll records them without alerts.
     devices_learning: bool,
+    sweeper: Arc<Sweeper>,
+    /// The first sweep's answers become baseline too: devices that were already
+    /// on the network but never talked to this PC shouldn't each raise an alert.
+    sweep_learning: bool,
     /// Our own PID; NetWatch's feed downloads are never flagged.
     me: u32,
 }
 
 impl Monitor {
-    pub fn new(intel: Arc<Intel>, store: Arc<Store>, dns: Arc<DnsNames>, vendors: Arc<Vendors>) -> Self {
+    pub fn new(
+        intel: Arc<Intel>,
+        store: Arc<Store>,
+        dns: Arc<DnsNames>,
+        vendors: Arc<Vendors>,
+        sweeper: Arc<Sweeper>,
+    ) -> Self {
         let sigs: Arc<Mutex<HashMap<String, SigInfo>>> = Arc::default();
         let (sig_tx, sig_rx) = mpsc::channel::<String>();
 
@@ -257,6 +268,7 @@ impl Monitor {
         let known_listeners = store.known_listeners().unwrap_or_default();
         let alerted = store.alert_keys().unwrap_or_default();
         let devices_baseline_at = store.devices_baseline_at().unwrap_or(0);
+        let sweep_learning = !store.sweep_baselined().unwrap_or(true);
         let devices: HashMap<String, Device> =
             store.devices().unwrap_or_default().into_iter().map(|d| (d.mac.clone(), d)).collect();
 
@@ -284,6 +296,8 @@ impl Monitor {
             devices_learning: devices.is_empty(),
             devices_baseline_at,
             devices,
+            sweeper,
+            sweep_learning,
             me: std::process::id(),
         }
     }
@@ -478,7 +492,10 @@ impl Monitor {
                 .is_some_and(|t| t > self.baseline_at + 60_000 && now.saturating_sub(t) < DAY_MS);
         }
 
-        let devices = self.update_devices(&devices::neighbors(&ifaces.lan), now);
+        let (sweep, answered) = self.sweeper.take();
+        let mut seen = devices::neighbors(&ifaces.lan);
+        seen.extend(answered);
+        let devices = self.merge_devices(&seen, &sweep, now);
         self.record_history(&conns);
         if first_tick {
             // The baseline is captured; later runs alert on anything new.
@@ -499,15 +516,28 @@ impl Monitor {
             dns_names: self.dns.active(),
             conns,
             devices,
+            sweep,
             stats,
             alerts: self.store.recent_alerts(MAX_ALERTS).unwrap_or_default(),
             intel: self.intel.status(),
         }
     }
 
+    /// Until the first sweep has landed, anything new is part of the baseline:
+    /// devices already on the network shouldn't each raise an alert just
+    /// because Windows happened to talk to them before the sweep finished.
+    fn merge_devices(&mut self, seen: &[devices::Neighbor], sweep: &SweepStatus, now: u64) -> Vec<DeviceView> {
+        let views = self.update_devices(seen, now, self.sweep_learning);
+        if self.sweep_learning && sweep.last_scan.is_some() {
+            self.sweep_learning = false;
+            let _ = self.store.mark_sweep_baselined();
+        }
+        views
+    }
+
     /// Merges this poll's neighbor table into the device list, queues database
     /// writes and alerts on devices never seen before.
-    fn update_devices(&mut self, seen: &[devices::Neighbor], now: u64) -> Vec<DeviceView> {
+    fn update_devices(&mut self, seen: &[devices::Neighbor], now: u64, quiet: bool) -> Vec<DeviceView> {
         let mut online = HashSet::new();
         for n in seen {
             let mac = devices::fmt_mac(&n.mac);
@@ -530,7 +560,7 @@ impl Monitor {
                 }
                 None => {
                     let d = Device { mac: mac.clone(), ip, name, vendor, first_seen: now, last_seen: now };
-                    if !self.devices_learning {
+                    if !self.devices_learning && !quiet {
                         let what = d.name.clone().or(d.vendor.clone()).unwrap_or_else(|| {
                             let kind = if devices::is_private_mac(&n.mac) { "Device with a private MAC" } else { "Unknown device" };
                             kind.to_string()
@@ -877,13 +907,51 @@ mod tests {
     use super::*;
     use crate::store::Rule;
 
+    fn neighbor(last: u8) -> devices::Neighbor {
+        devices::Neighbor { mac: [0x00, 0x11, 0x22, 0x33, 0x44, last], ip: IpAddr::from([192, 0, 2, last]) }
+    }
+
+    fn device_alerts(store: &Store) -> usize {
+        store.recent_alerts(100).unwrap().iter().filter(|a| a.title.starts_with("New device")).count()
+    }
+
+    /// Devices already on the network stay quiet until the first sweep is in;
+    /// only devices that appear after that raise alerts.
+    #[test]
+    fn device_baseline_waits_for_first_sweep() {
+        let base = std::env::temp_dir().join("netwatch-test");
+        let db = base.join("devices-test.db");
+        let _ = std::fs::remove_file(&db);
+        let (intel, _refresh) = Intel::start(base.join("intel"));
+        let store = Arc::new(Store::open(&db).unwrap());
+        let mut m = Monitor::new(intel, store.clone(), Arc::default(), Arc::default(), Arc::default());
+
+        let not_yet = SweepStatus::default();
+        let swept = SweepStatus { last_scan: Some(2_500), ..Default::default() };
+
+        m.merge_devices(&[neighbor(1)], &not_yet, 1_000);
+        assert!(!m.devices_learning, "first poll is the passive baseline");
+        // Before the first sweep finishes, more existing devices trickle in.
+        m.merge_devices(&[neighbor(1), neighbor(2)], &not_yet, 2_000);
+        assert_eq!(device_alerts(&store), 0, "no alerts before the first sweep");
+        // The first sweep's answers are baseline too.
+        m.merge_devices(&[neighbor(1), neighbor(2), neighbor(3)], &swept, 3_000);
+        assert_eq!(device_alerts(&store), 0, "first sweep is quiet");
+        assert!(store.sweep_baselined().unwrap());
+
+        let views = m.merge_devices(&[neighbor(1), neighbor(4)], &swept, 4_000);
+        assert_eq!(device_alerts(&store), 1, "a device joining after the sweep alerts");
+        assert_eq!(views.len(), 4);
+        assert_eq!(views.iter().filter(|v| v.online).count(), 2);
+    }
+
     #[test]
     fn live_scan_smoke() {
         let base = std::env::temp_dir().join("netwatch-test");
         let _ = std::fs::remove_file(base.join("test.db"));
         let (intel, _refresh) = Intel::start(base.join("intel"));
         let store = Arc::new(Store::open(&base.join("test.db")).unwrap());
-        let mut m = Monitor::new(intel.clone(), store.clone(), Arc::default(), Arc::default());
+        let mut m = Monitor::new(intel.clone(), store.clone(), Arc::default(), Arc::default(), Arc::default());
         assert!(m.learning, "fresh database starts in learning mode");
         m.tick();
         assert!(!m.learning);
@@ -923,7 +991,7 @@ mod tests {
         assert!(info.connections > 0, "history rows written");
 
         // A restarted monitor keeps the baseline and doesn't relearn.
-        let m2 = Monitor::new(intel, store, Arc::default(), Arc::default());
+        let m2 = Monitor::new(intel, store, Arc::default(), Arc::default(), Arc::default());
         assert!(!m2.learning);
     }
 }

@@ -5,20 +5,29 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use serde::Serialize;
 use windows::Win32::Foundation::NO_ERROR;
-use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIpNetTable2, MIB_IPNET_TABLE2};
+use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIpNetTable2, SendARP, MIB_IPNET_TABLE2};
 use windows::Win32::Networking::WinSock::{
     AF_INET, AF_INET6, AF_UNSPEC, NlnsIncomplete, NlnsUnreachable,
 };
 
+use crate::ifaces::{self, LanNet};
 use crate::intel;
+use crate::monitor::now_ms;
 
 const OUI_URL: &str = "https://standards-oui.ieee.org/oui/oui.csv";
 const OUI_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
 const OUI_RETRY: Duration = Duration::from_secs(6 * 3600);
+const SWEEP_EVERY: Duration = Duration::from_secs(5 * 60);
+const SWEEP_THREADS: usize = 64;
+/// Larger subnets are only swept around this PC: at most 1,024 addresses.
+const MIN_SWEEP_PREFIX: u8 = 22;
 
 /// A device seen in the neighbor table during this poll.
 #[derive(Clone, Debug)]
@@ -84,6 +93,127 @@ pub fn neighbors(lan: &HashSet<u32>) -> Vec<Neighbor> {
         FreeMibTable(table as *const _);
     }
     by_mac.into_iter().map(|(mac, ip)| Neighbor { mac, ip }).collect()
+}
+
+/* ---------- Active sweep ---------- */
+
+/// Every address in the subnet around `net.ip` (capped at a /22), minus the
+/// network and broadcast addresses and this PC itself.
+fn sweep_targets(net: &LanNet) -> Vec<Ipv4Addr> {
+    if net.prefix >= 31 {
+        return Vec::new();
+    }
+    let prefix = net.prefix.max(MIN_SWEEP_PREFIX);
+    let mask = u32::MAX << (32 - prefix);
+    let base = u32::from(net.ip) & mask;
+    let last = base | !mask;
+    (base + 1..last).map(Ipv4Addr::from).filter(|a| *a != net.ip).collect()
+}
+
+/// Asks `dest` for its MAC address. Devices can ignore pings but not ARP.
+fn arp(dest: Ipv4Addr, src: Ipv4Addr) -> Option<[u8; 6]> {
+    let mut buf = [0u8; 8];
+    let mut len = buf.len() as u32;
+    let rc = unsafe {
+        SendARP(
+            u32::from_ne_bytes(dest.octets()),
+            u32::from_ne_bytes(src.octets()),
+            buf.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    let mut mac = [0u8; 6];
+    mac.copy_from_slice(&buf[..6]);
+    (rc == NO_ERROR.0 && len == 6 && is_device_mac(&mac)).then_some(mac)
+}
+
+fn sweep(nets: &[LanNet]) -> Vec<Neighbor> {
+    let jobs: Vec<(Ipv4Addr, Ipv4Addr)> =
+        nets.iter().flat_map(|n| sweep_targets(n).into_iter().map(move |t| (t, n.ip))).collect();
+    let next = AtomicUsize::new(0);
+    let found = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..SWEEP_THREADS.min(jobs.len()) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&(dest, src)) = jobs.get(i) else { break };
+                if let Some(mac) = arp(dest, src) {
+                    found.lock().unwrap().push(Neighbor { mac, ip: IpAddr::V4(dest) });
+                }
+            });
+        }
+    });
+    found.into_inner().unwrap()
+}
+
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SweepStatus {
+    pub scanning: bool,
+    pub last_scan: Option<u64>,
+    /// Devices that answered the last sweep.
+    pub found: usize,
+    /// Subnets covered, e.g. "192.0.2.0/24".
+    pub networks: Vec<String>,
+}
+
+#[derive(Default)]
+struct SweepState {
+    status: SweepStatus,
+    /// Answers not yet merged into the device list.
+    pending: Vec<Neighbor>,
+}
+
+/// Sweeps the local subnets every few minutes, or right away on request.
+#[derive(Default)]
+pub struct Sweeper {
+    state: Mutex<SweepState>,
+}
+
+impl Sweeper {
+    pub fn start() -> (Arc<Self>, Sender<()>) {
+        let me = Arc::new(Self::default());
+        let (tx, rx) = mpsc::channel();
+        let worker = me.clone();
+        std::thread::Builder::new()
+            .name("device-sweep".into())
+            .spawn(move || worker.run(rx))
+            .expect("spawn device sweeper");
+        (me, tx)
+    }
+
+    fn run(&self, rx: Receiver<()>) {
+        loop {
+            let nets: Vec<LanNet> = ifaces::collect().lan_v4.into_iter().filter(|n| n.prefix < 31).collect();
+            let networks = nets
+                .iter()
+                .map(|n| {
+                    let prefix = n.prefix.max(MIN_SWEEP_PREFIX);
+                    let base = Ipv4Addr::from(u32::from(n.ip) & (u32::MAX << (32 - prefix)));
+                    format!("{base}/{prefix}")
+                })
+                .collect();
+            self.state.lock().unwrap().status.scanning = true;
+            let found = sweep(&nets);
+            {
+                let mut st = self.state.lock().unwrap();
+                st.status = SweepStatus { scanning: false, last_scan: Some(now_ms()), found: found.len(), networks };
+                st.pending.extend(found);
+            }
+            // Requests that piled up during the sweep are already answered.
+            while rx.try_recv().is_ok() {}
+            match rx.recv_timeout(SWEEP_EVERY) {
+                Ok(()) | Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
+    /// The current status plus answers that arrived since the last call.
+    pub fn take(&self) -> (SweepStatus, Vec<Neighbor>) {
+        let mut st = self.state.lock().unwrap();
+        (st.status.clone(), std::mem::take(&mut st.pending))
+    }
 }
 
 /* ---------- Manufacturer lookup ---------- */
@@ -185,6 +315,31 @@ mod tests {
         assert!(is_private_mac(&[0x02, 0x11, 0x22, 0x33, 0x44, 0x55]));
         assert!(!is_private_mac(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]));
         assert_eq!(fmt_mac(&[0x00, 0x0a, 0xff, 0x01, 0x02, 0x03]), "00:0a:ff:01:02:03");
+    }
+
+    #[test]
+    fn sweep_targets_cover_the_subnet() {
+        let me = Ipv4Addr::new(192, 0, 2, 10);
+        let t = sweep_targets(&LanNet { ip: me, prefix: 24 });
+        assert_eq!(t.len(), 253, "254 hosts minus this PC");
+        assert!(!t.contains(&me));
+        assert_eq!(t.first(), Some(&Ipv4Addr::new(192, 0, 2, 1)));
+        assert_eq!(t.last(), Some(&Ipv4Addr::new(192, 0, 2, 254)));
+        // A /16 is capped to the /22 around this PC.
+        let big = sweep_targets(&LanNet { ip: Ipv4Addr::new(10, 20, 30, 40), prefix: 16 });
+        assert_eq!(big.len(), 1021);
+        assert_eq!(big.first(), Some(&Ipv4Addr::new(10, 20, 28, 1)));
+        assert!(sweep_targets(&LanNet { ip: me, prefix: 31 }).is_empty());
+    }
+
+    /// Sweeps this PC's real subnets; prints only counts, never addresses.
+    #[test]
+    fn sweeps_local_network() {
+        let nets = crate::ifaces::collect().lan_v4;
+        let started = std::time::Instant::now();
+        let found = sweep(&nets);
+        println!("sweep: {} subnets, {} devices answered in {:.1?}", nets.len(), found.len(), started.elapsed());
+        assert!(found.iter().all(|n| is_device_mac(&n.mac)));
     }
 
     /// Reads this PC's neighbor table; prints only a count, never addresses.

@@ -265,6 +265,17 @@ impl Store {
         self.first_time("devices_baseline_at")
     }
 
+    /// Whether the first active device sweep has been recorded as baseline.
+    pub fn sweep_baselined(&self) -> Res<bool> {
+        let c = self.conn.lock().unwrap();
+        c.query_row("SELECT COUNT(*) FROM meta WHERE key = 'sweep_baseline_at'", [], |r| r.get::<_, i64>(0))
+            .map(|n| n > 0)
+    }
+
+    pub fn mark_sweep_baselined(&self) -> Res<u64> {
+        self.first_time("sweep_baseline_at")
+    }
+
     fn first_time(&self, key: &str) -> Res<u64> {
         let c = self.conn.lock().unwrap();
         c.execute("INSERT OR IGNORE INTO meta (key, value) VALUES (?1, ?2)", [key, &now_ms().to_string()])?;

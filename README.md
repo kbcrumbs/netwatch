@@ -26,9 +26,10 @@ NetWatch only watches. It never blocks, kills or changes anything.
   - **VPN leaks**: public traffic leaving through another adapter while a VPN
     tunnel is up
   - programs and listening ports that are new since the first run
-- **Devices on your network**: every device this PC sees on the local network
-  (read passively from Windows' neighbor table, never through the VPN tunnel),
-  with its manufacturer from the IEEE MAC registry. Phones that use private,
+- **Devices on your network**: every device on the local network, from
+  Windows' neighbor table plus an ARP sweep of the subnet every 5 minutes (or
+  on demand with **Scan now**; never through the VPN tunnel, capped at 1,024
+  addresses), with its manufacturer from the IEEE MAC registry. Phones that use private,
   randomized MAC addresses are marked as such. Devices that join after the
   first run raise an alert.
 - **Geolocation and ownership**: country and network owner (ASN) for every

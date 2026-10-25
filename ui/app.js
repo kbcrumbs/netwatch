@@ -551,7 +551,15 @@ function renderDevices() {
   rows.sort((a, b) => cmp(ipKey(a.ip), ipKey(b.ip)));
   rows = sortRows(rows, "devices", DEV_GET);
   const online = state.snap.devices.filter((d) => d.online).length;
-  $("shown").textContent = `${online} online · ${state.snap.devices.length} known`;
+  const sw = state.snap.sweep;
+  const scanBtn = $("scan-devices");
+  scanBtn.disabled = sw.scanning || state.scanRequested;
+  scanBtn.textContent = sw.scanning || state.scanRequested ? "Scanning…" : "Scan now";
+  if (!sw.scanning && sw.lastScan && sw.lastScan > (state.scanRequested ?? 0)) state.scanRequested = null;
+  const swept = sw.lastScan
+    ? ` · last scan ${clock(sw.lastScan)}${sw.networks.length ? ` (${sw.networks.join(", ")})` : ""}`
+    : sw.scanning ? " · scanning…" : "";
+  $("shown").textContent = `${online} online · ${state.snap.devices.length} known${swept}`;
   if (!rows.length) {
     return emptyState(
       state.search ? "No devices match this filter." : "Devices appear here as this PC talks to them on the local network.",
@@ -900,6 +908,7 @@ document.querySelectorAll(".tab").forEach((btn) =>
     document.querySelectorAll("#toolbar .chip").forEach((c) => (c.hidden = !live));
     $("hist-range").hidden = state.tab !== "history";
     $("show-acked-chip").hidden = $("ack-all").hidden = $("copy-alerts").hidden = state.tab !== "alerts";
+    $("scan-devices").hidden = state.tab !== "devices";
     $("view").scrollTop = 0;
     if (state.tab === "history") loadHistory();
     if (state.tab === "rules") loadRules();
@@ -953,6 +962,12 @@ $("search").addEventListener("input", (e) => {
 $("hist-range").addEventListener("change", (e) => {
   state.histHours = Number(e.target.value);
   loadHistory();
+});
+$("scan-devices").addEventListener("click", () => {
+  // Remembered until a sweep newer than the click finishes.
+  state.scanRequested = Date.now();
+  invoke("scan_devices");
+  render();
 });
 $("copy-alerts").addEventListener("click", () => {
   const text = (state.shownAlerts ?? []).map(alertText).join("\n\n");

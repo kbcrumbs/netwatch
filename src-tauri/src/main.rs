@@ -30,6 +30,8 @@ type Latest = Arc<Mutex<Option<Snapshot>>>;
 
 struct IntelRefresh(Mutex<Option<Sender<()>>>);
 
+struct DeviceScan(Mutex<Option<Sender<()>>>);
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SystemInfo {
@@ -56,6 +58,14 @@ fn system_info() -> SystemInfo {
 #[tauri::command]
 fn refresh_intel(refresh: State<IntelRefresh>) {
     if let Some(tx) = refresh.0.lock().unwrap().as_ref() {
+        let _ = tx.send(());
+    }
+}
+
+/// Sweeps the local network for devices now instead of at the next interval.
+#[tauri::command]
+fn scan_devices(scan: State<DeviceScan>) {
+    if let Some(tx) = scan.0.lock().unwrap().as_ref() {
         let _ = tx.send(());
     }
 }
@@ -100,6 +110,7 @@ fn main() {
     tauri::Builder::default()
         .manage(Latest::default())
         .manage(IntelRefresh(Mutex::new(None)))
+        .manage(DeviceScan(Mutex::new(None)))
         .setup(|app| {
             let handle = app.handle().clone();
             let latest = app.state::<Latest>().inner().clone();
@@ -108,11 +119,13 @@ fn main() {
             app.manage(store.clone());
             let (intel, refresh_tx) = intel::Intel::start(data_dir.join("intel"));
             let vendors = devices::Vendors::start(data_dir.join("intel"));
+            let (sweeper, scan_tx) = devices::Sweeper::start();
+            *app.state::<DeviceScan>().0.lock().unwrap() = Some(scan_tx);
             *app.state::<IntelRefresh>().0.lock().unwrap() = Some(refresh_tx);
             std::thread::Builder::new()
                 .name("net-poller".into())
                 .spawn(move || {
-                    let mut monitor = Monitor::new(intel, store, dns::DnsNames::start(), vendors);
+                    let mut monitor = Monitor::new(intel, store, dns::DnsNames::start(), vendors, sweeper);
                     loop {
                         let snap = monitor.tick();
                         let _ = handle.emit("snapshot", &snap);
@@ -126,6 +139,7 @@ fn main() {
             get_snapshot,
             system_info,
             refresh_intel,
+            scan_devices,
             history,
             db_info,
             list_rules,
